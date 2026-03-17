@@ -13,13 +13,15 @@
 - оценивает базовые SEO-сигналы: `meta description`, `canonical`, наличие `H1`, дубликаты `title` и `meta description`
 - определяет директивы `noindex` и `nofollow` из `meta robots`
 - помечает страницы, где `canonical` не совпадает с итоговым URL
+- проверяет изображения и находит `img` без `alt` или с пустым `alt`
 - находит внутренние ссылки на странице
 - продолжает обход страниц того же домена
 - фиксирует битые ссылки, если запрос не удался или сервер вернул код `400+`
 - повторяет нестабильные запросы при временных ошибках сервера
 - проверяет наличие и доступность `robots.txt` и `sitemap.xml`
 - ищет orphan-страницы: URL из sitemap, которые не попали в обход
-- сохраняет результаты в `pages_report.csv`, `broken_links_report.csv`, `site_report.csv`, `summary_report.csv` и `orphan_pages_report.csv`
+- генерирует HTML-отчёт для просмотра результатов в браузере
+- сохраняет результаты в `pages_report.csv`, `broken_links_report.csv`, `site_report.csv`, `summary_report.csv`, `orphan_pages_report.csv`, `image_issues_report.csv` и `audit_report.html`
 
 ## Используемые технологии
 
@@ -76,6 +78,9 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - `canonical URL`
 - флаг несоответствия `canonical` итоговому URL
 - количество тегов `H1`
+- количество изображений на странице
+- количество изображений без `alt`
+- количество изображений с пустым `alt`
 - количество найденных внутренних ссылок
 - флаги проблем: отсутствует `title`, `meta description`, `H1` или найдены дубликаты `title`/`meta description`
 
@@ -118,3 +123,22 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - URL страницы из sitemap
 - признак наличия URL в sitemap
 - признак того, что страница не была обойдена краулером
+
+### `image_issues_report.csv`
+
+Содержит:
+
+- страницу, на которой найдено изображение
+- URL изображения
+- тип проблемы (`missing_alt` или `empty_alt`)
+- текущее значение `alt`
+
+### `audit_report.html`
+
+Содержит визуальный дашборд:
+
+- общую сводку метрик
+- таблицу страниц и SEO-флагов
+- битые ссылки
+- проблемы изображений
+- orphan-страницы из sitemap

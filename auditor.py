@@ -1,9 +1,11 @@
 import argparse
 import csv
+import html
 import time
 import warnings
 import xml.etree.ElementTree as ET
 from collections import Counter, deque
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urldefrag, urljoin, urlparse
 
@@ -20,6 +22,8 @@ BROKEN_LINKS_REPORT_FILE = "broken_links_report.csv"
 SITE_REPORT_FILE = "site_report.csv"
 SUMMARY_REPORT_FILE = "summary_report.csv"
 ORPHAN_PAGES_REPORT_FILE = "orphan_pages_report.csv"
+IMAGE_ISSUES_REPORT_FILE = "image_issues_report.csv"
+HTML_REPORT_FILE = "audit_report.html"
 REQUEST_FAILED_STATUS = "REQUEST_FAILED"
 
 
@@ -103,8 +107,19 @@ def send_request(
         return None, str(exc), elapsed_ms
 
 
-def extract_page_data(html: str, base_url: str, domain: str) -> Dict[str, object]:
-    soup = BeautifulSoup(html, "html.parser")
+def build_absolute_asset_url(base_url: str, asset_url: str) -> str:
+    if not asset_url:
+        return ""
+
+    if asset_url.startswith(("data:", "javascript:")):
+        return asset_url
+
+    absolute_url = urljoin(base_url, asset_url)
+    return normalize_url(absolute_url) or absolute_url
+
+
+def extract_page_data(html_content: str, base_url: str, domain: str) -> Dict[str, object]:
+    soup = BeautifulSoup(html_content, "html.parser")
 
     title_tag = soup.find("title")
     title = title_tag.get_text(strip=True) if title_tag else ""
@@ -136,6 +151,32 @@ def extract_page_data(html: str, base_url: str, domain: str) -> Dict[str, object
 
     h1_tags = soup.find_all("h1")
     internal_links: Set[str] = set()
+    image_issues: List[Dict[str, object]] = []
+    images = soup.find_all("img")
+
+    for image in images:
+        src = image.get("src", "").strip()
+        alt_value = image.get("alt")
+        normalized_image_url = build_absolute_asset_url(base_url, src)
+
+        if alt_value is None:
+            image_issues.append(
+                {
+                    "image_url": normalized_image_url,
+                    "issue_type": "missing_alt",
+                    "alt_text": "",
+                }
+            )
+            continue
+
+        if not alt_value.strip():
+            image_issues.append(
+                {
+                    "image_url": normalized_image_url,
+                    "issue_type": "empty_alt",
+                    "alt_text": alt_value,
+                }
+            )
 
     for anchor in soup.find_all("a", href=True):
         href = anchor["href"].strip()
@@ -156,6 +197,10 @@ def extract_page_data(html: str, base_url: str, domain: str) -> Dict[str, object
         "nofollow": "nofollow" in robots_directives,
         "canonical_url": canonical_url,
         "h1_count": len(h1_tags),
+        "images_count": len(images),
+        "images_missing_alt": sum(1 for issue in image_issues if issue["issue_type"] == "missing_alt"),
+        "images_empty_alt": sum(1 for issue in image_issues if issue["issue_type"] == "empty_alt"),
+        "image_issues": image_issues,
         "internal_links": internal_links,
         "missing_title": not bool(title),
         "missing_meta_description": not bool(meta_description),
@@ -326,6 +371,7 @@ def build_summary_report(
     broken_links_report: List[Dict[str, object]],
     site_report: Dict[str, object],
     orphan_pages_report: List[Dict[str, object]],
+    image_issues_report: List[Dict[str, object]],
 ) -> List[Dict[str, object]]:
     return [
         {"metric": "pages_crawled", "value": len(pages_report)},
@@ -344,6 +390,18 @@ def build_summary_report(
         {"metric": "pages_with_noindex", "value": sum(1 for page in pages_report if page["noindex"])},
         {"metric": "pages_with_nofollow", "value": sum(1 for page in pages_report if page["nofollow"])},
         {"metric": "pages_with_redirects", "value": sum(1 for page in pages_report if page["redirect_count"] > 0)},
+        {"metric": "images_found", "value": sum(int(page["images_count"]) for page in pages_report)},
+        {"metric": "images_missing_alt", "value": sum(int(page["images_missing_alt"]) for page in pages_report)},
+        {"metric": "images_empty_alt", "value": sum(int(page["images_empty_alt"]) for page in pages_report)},
+        {
+            "metric": "pages_with_image_alt_issues",
+            "value": sum(
+                1
+                for page in pages_report
+                if int(page["images_missing_alt"]) > 0 or int(page["images_empty_alt"]) > 0
+            ),
+        },
+        {"metric": "image_issues_found", "value": len(image_issues_report)},
         {
             "metric": "pages_with_canonical_mismatch",
             "value": sum(1 for page in pages_report if page["canonical_mismatch"]),
@@ -374,6 +432,9 @@ def write_pages_report(pages: List[Dict[str, object]]) -> None:
                 "canonical_url",
                 "canonical_mismatch",
                 "h1_count",
+                "images_count",
+                "images_missing_alt",
+                "images_empty_alt",
                 "internal_links_count",
                 "missing_title",
                 "missing_meta_description",
@@ -399,6 +460,9 @@ def write_pages_report(pages: List[Dict[str, object]]) -> None:
                     page["canonical_url"],
                     page["canonical_mismatch"],
                     page["h1_count"],
+                    page["images_count"],
+                    page["images_missing_alt"],
+                    page["images_empty_alt"],
                     page["internal_links_count"],
                     page["missing_title"],
                     page["missing_meta_description"],
@@ -462,6 +526,259 @@ def write_orphan_pages_report(orphan_pages_report: List[Dict[str, object]]) -> N
             writer.writerow([item["sitemap_url"], item["in_sitemap"], item["crawled"]])
 
 
+def write_image_issues_report(image_issues_report: List[Dict[str, object]]) -> None:
+    with open(IMAGE_ISSUES_REPORT_FILE, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(["source_page", "image_url", "issue_type", "alt_text"])
+        for item in image_issues_report:
+            writer.writerow(
+                [
+                    item["source_page"],
+                    item["image_url"],
+                    item["issue_type"],
+                    item["alt_text"],
+                ]
+            )
+
+
+def render_table(headers: List[str], rows: List[List[object]]) -> str:
+    header_html = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
+    body_rows = []
+    for row in rows:
+        cells = "".join(f"<td>{html.escape(str(cell))}</td>" for cell in row)
+        body_rows.append(f"<tr>{cells}</tr>")
+
+    body_html = "".join(body_rows) if body_rows else f"<tr><td colspan=\"{len(headers)}\">No data</td></tr>"
+    return (
+        "<div class=\"table-wrap\">"
+        "<table>"
+        f"<thead><tr>{header_html}</tr></thead>"
+        f"<tbody>{body_html}</tbody>"
+        "</table>"
+        "</div>"
+    )
+
+
+def write_html_report(
+    start_url: str,
+    summary_report: List[Dict[str, object]],
+    site_report: Dict[str, object],
+    pages_report: List[Dict[str, object]],
+    broken_links_report: List[Dict[str, object]],
+    orphan_pages_report: List[Dict[str, object]],
+    image_issues_report: List[Dict[str, object]],
+) -> None:
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    summary_cards = "".join(
+        (
+            "<div class=\"card\">"
+            f"<div class=\"metric\">{html.escape(str(item['value']))}</div>"
+            f"<div class=\"label\">{html.escape(str(item['metric']))}</div>"
+            "</div>"
+        )
+        for item in summary_report
+    )
+
+    pages_rows = [
+        [
+            page["final_url"],
+            page["status"],
+            page["title"],
+            page["images_count"],
+            page["images_missing_alt"],
+            page["images_empty_alt"],
+            page["canonical_mismatch"],
+        ]
+        for page in pages_report
+    ]
+    broken_rows = [
+        [item["source_page"], item["broken_link"], item["status"]]
+        for item in broken_links_report
+    ]
+    image_rows = [
+        [item["source_page"], item["image_url"], item["issue_type"], item["alt_text"]]
+        for item in image_issues_report
+    ]
+    orphan_rows = [
+        [item["sitemap_url"], item["in_sitemap"], item["crawled"]]
+        for item in orphan_pages_report
+    ]
+    site_rows = [[
+        site_report["site_root"],
+        site_report["robots_status"],
+        site_report["sitemap_status"],
+        site_report["sitemap_urls_count"],
+    ]]
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Website Auditor Report</title>
+  <style>
+    :root {{
+      --bg: #f5efe5;
+      --panel: #fffaf2;
+      --ink: #1f1a16;
+      --muted: #6c6258;
+      --line: #d6c7b6;
+      --accent: #b85c38;
+      --accent-soft: #f0d7c7;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, #f9e3d2 0, transparent 28%),
+        linear-gradient(160deg, #f6f0e6 0%, #ece2d3 100%);
+    }}
+    .page {{
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 32px 20px 56px;
+    }}
+    .hero {{
+      background: rgba(255, 250, 242, 0.88);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 28px;
+      box-shadow: 0 18px 40px rgba(55, 35, 20, 0.08);
+    }}
+    h1, h2 {{
+      margin: 0 0 12px;
+      font-weight: 600;
+    }}
+    .subtitle {{
+      color: var(--muted);
+      margin: 0;
+      line-height: 1.6;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 14px;
+      margin: 24px 0 0;
+    }}
+    .card {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 16px;
+    }}
+    .metric {{
+      font-size: 30px;
+      font-weight: 700;
+      color: var(--accent);
+      line-height: 1.1;
+    }}
+    .label {{
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 14px;
+      word-break: break-word;
+    }}
+    .section {{
+      margin-top: 24px;
+      background: rgba(255, 250, 242, 0.88);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      padding: 24px;
+      box-shadow: 0 18px 40px rgba(55, 35, 20, 0.06);
+    }}
+    .table-wrap {{
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel);
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 640px;
+    }}
+    th, td {{
+      padding: 12px 14px;
+      text-align: left;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      font-size: 14px;
+    }}
+    th {{
+      background: var(--accent-soft);
+      color: var(--ink);
+      position: sticky;
+      top: 0;
+    }}
+    tr:last-child td {{
+      border-bottom: 0;
+    }}
+    .meta {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 16px;
+      color: var(--muted);
+      font-size: 14px;
+    }}
+    @media (max-width: 720px) {{
+      .page {{
+        padding: 20px 14px 40px;
+      }}
+      .hero, .section {{
+        padding: 18px;
+        border-radius: 18px;
+      }}
+      .metric {{
+        font-size: 24px;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <h1>Website Auditor Report</h1>
+      <p class="subtitle">Audit results for {html.escape(start_url)}. This dashboard combines crawl metrics, SEO flags, broken links, sitemap coverage, and image accessibility issues.</p>
+      <div class="meta">
+        <span>Generated: {html.escape(generated_at)}</span>
+        <span>Pages crawled: {html.escape(str(len(pages_report)))}</span>
+        <span>Broken links: {html.escape(str(len(broken_links_report)))}</span>
+        <span>Image issues: {html.escape(str(len(image_issues_report)))}</span>
+      </div>
+      <div class="grid">{summary_cards}</div>
+    </section>
+    <section class="section">
+      <h2>Site Resources</h2>
+      {render_table(["Site root", "robots.txt", "sitemap", "URLs in sitemap"], site_rows)}
+    </section>
+    <section class="section">
+      <h2>Pages Overview</h2>
+      {render_table(["Final URL", "HTTP", "Title", "Images", "Missing alt", "Empty alt", "Canonical mismatch"], pages_rows)}
+    </section>
+    <section class="section">
+      <h2>Broken Links</h2>
+      {render_table(["Source page", "Broken link", "Status"], broken_rows)}
+    </section>
+    <section class="section">
+      <h2>Image Issues</h2>
+      {render_table(["Source page", "Image URL", "Issue type", "Alt text"], image_rows)}
+    </section>
+    <section class="section">
+      <h2>Orphan Pages From Sitemap</h2>
+      {render_table(["Sitemap URL", "In sitemap", "Crawled"], orphan_rows)}
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+    with open(HTML_REPORT_FILE, "w", encoding="utf-8") as file:
+        file.write(html_content)
+
+
 def append_failed_page(
     pages_report: List[Dict[str, object]],
     url: str,
@@ -484,6 +801,9 @@ def append_failed_page(
             "canonical_url": "",
             "canonical_mismatch": False,
             "h1_count": 0,
+            "images_count": 0,
+            "images_missing_alt": 0,
+            "images_empty_alt": 0,
             "internal_links_count": 0,
             "missing_title": True,
             "missing_meta_description": True,
@@ -499,6 +819,7 @@ def print_summary(
     broken_links_report: List[Dict[str, object]],
     site_report: Dict[str, object],
     orphan_pages_report: List[Dict[str, object]],
+    image_issues_report: List[Dict[str, object]],
 ) -> None:
     title_issues = sum(1 for page in pages_report if page["missing_title"])
     meta_issues = sum(1 for page in pages_report if page["missing_meta_description"])
@@ -508,6 +829,9 @@ def print_summary(
     noindex_pages = sum(1 for page in pages_report if page["noindex"])
     nofollow_pages = sum(1 for page in pages_report if page["nofollow"])
     canonical_mismatches = sum(1 for page in pages_report if page["canonical_mismatch"])
+    image_issues = len(image_issues_report)
+    images_missing_alt = sum(int(page["images_missing_alt"]) for page in pages_report)
+    images_empty_alt = sum(int(page["images_empty_alt"]) for page in pages_report)
     redirects = sum(1 for page in pages_report if page["redirect_count"] > 0)
     status_counter = Counter(str(item["status"]) for item in broken_links_report)
 
@@ -519,6 +843,10 @@ def print_summary(
     print(
         f"[SUMMARY] Страниц с noindex: {noindex_pages}, с nofollow: {nofollow_pages}, "
         f"с canonical mismatch: {canonical_mismatches}, страниц с редиректами: {redirects}"
+    )
+    print(
+        f"[SUMMARY] Проблем изображений: {image_issues}, missing alt: {images_missing_alt}, "
+        f"empty alt: {images_empty_alt}"
     )
     print(
         f"[SUMMARY] robots.txt: {site_report['robots_status']} "
@@ -537,7 +865,13 @@ def audit_website(
     max_pages: int,
     timeout: int,
     allow_insecure: bool,
-) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], Dict[str, object], List[Dict[str, object]]]:
+) -> Tuple[
+    List[Dict[str, object]],
+    List[Dict[str, object]],
+    Dict[str, object],
+    List[Dict[str, object]],
+    List[Dict[str, object]],
+]:
     normalized_start_url = normalize_url(start_url)
     if not normalized_start_url:
         raise ValueError("Стартовый URL должен быть абсолютным HTTP(S)-адресом.")
@@ -554,6 +888,7 @@ def audit_website(
 
     pages_report: List[Dict[str, object]] = []
     broken_links_report: List[Dict[str, object]] = []
+    image_issues_report: List[Dict[str, object]] = []
     queued_urls = deque([normalized_start_url])
     visited_urls: Set[str] = set()
     discovered_urls: Set[str] = {normalized_start_url}
@@ -605,6 +940,9 @@ def audit_website(
                         "canonical_url": "",
                         "canonical_mismatch": False,
                         "h1_count": 0,
+                        "images_count": 0,
+                        "images_missing_alt": 0,
+                        "images_empty_alt": 0,
                         "internal_links_count": 0,
                         "missing_title": True,
                         "missing_meta_description": True,
@@ -618,6 +956,15 @@ def audit_website(
             page_data = extract_page_data(response.text, final_url, domain)
             internal_links = page_data["internal_links"]
             canonical_mismatch = bool(page_data["canonical_url"]) and page_data["canonical_url"] != final_url
+            for issue in page_data["image_issues"]:
+                image_issues_report.append(
+                    {
+                        "source_page": current_url,
+                        "image_url": issue["image_url"],
+                        "issue_type": issue["issue_type"],
+                        "alt_text": issue["alt_text"],
+                    }
+                )
             print(
                 f"[INFO] HTTP {response.status_code}, {elapsed_ms} мс, "
                 f"редиректов: {redirect_count}, внутренних ссылок: {len(internal_links)}"
@@ -639,6 +986,9 @@ def audit_website(
                     "canonical_url": page_data["canonical_url"],
                     "canonical_mismatch": canonical_mismatch,
                     "h1_count": page_data["h1_count"],
+                    "images_count": page_data["images_count"],
+                    "images_missing_alt": page_data["images_missing_alt"],
+                    "images_empty_alt": page_data["images_empty_alt"],
                     "internal_links_count": len(internal_links),
                     "missing_title": page_data["missing_title"],
                     "missing_meta_description": page_data["missing_meta_description"],
@@ -671,14 +1021,14 @@ def audit_website(
         for url in sorted(site_report["sitemap_urls"])
         if url not in crawled_urls
     ]
-    return pages_report, broken_links_report, site_report, orphan_pages_report
+    return pages_report, broken_links_report, site_report, orphan_pages_report, image_issues_report
 
 
 def main() -> None:
     args = parse_args()
 
     try:
-        pages_report, broken_links_report, site_report, orphan_pages_report = audit_website(
+        pages_report, broken_links_report, site_report, orphan_pages_report, image_issues_report = audit_website(
             args.start_url,
             args.max_pages,
             args.timeout,
@@ -689,12 +1039,23 @@ def main() -> None:
             broken_links_report,
             site_report,
             orphan_pages_report,
+            image_issues_report,
         )
         write_pages_report(pages_report)
         write_broken_links_report(broken_links_report)
         write_site_report(site_report)
         write_summary_report(summary_report)
         write_orphan_pages_report(orphan_pages_report)
+        write_image_issues_report(image_issues_report)
+        write_html_report(
+            args.start_url,
+            summary_report,
+            site_report,
+            pages_report,
+            broken_links_report,
+            orphan_pages_report,
+            image_issues_report,
+        )
     except ValueError as exc:
         print(f"[ERROR] {exc}")
         raise SystemExit(1) from exc
@@ -714,7 +1075,15 @@ def main() -> None:
     print(f"[DONE] Отчёт по сайту: {SITE_REPORT_FILE}")
     print(f"[DONE] Сводный отчёт: {SUMMARY_REPORT_FILE}")
     print(f"[DONE] Отчёт по orphan-страницам: {ORPHAN_PAGES_REPORT_FILE}")
-    print_summary(pages_report, broken_links_report, site_report, orphan_pages_report)
+    print(f"[DONE] Отчёт по изображениям: {IMAGE_ISSUES_REPORT_FILE}")
+    print(f"[DONE] HTML-отчёт: {HTML_REPORT_FILE}")
+    print_summary(
+        pages_report,
+        broken_links_report,
+        site_report,
+        orphan_pages_report,
+        image_issues_report,
+    )
 
 
 if __name__ == "__main__":
