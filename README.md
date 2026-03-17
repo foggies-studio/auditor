@@ -12,6 +12,8 @@
 - извлекает содержимое тега `<title>`
 - оценивает базовые SEO-сигналы: `meta description`, `canonical`, наличие `H1`, дубликаты `title` и `meta description`
 - определяет директивы `noindex` и `nofollow` из `meta robots`
+- проверяет длину `title` и `meta description`
+- проверяет `lang`, `hreflang`, Open Graph и Twitter meta-теги
 - помечает страницы, где `canonical` не совпадает с итоговым URL
 - проверяет изображения и находит `img` без `alt` или с пустым `alt`
 - находит внутренние ссылки на странице
@@ -71,10 +73,16 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - время ответа в миллисекундах
 - количество редиректов
 - заголовок страницы
+- длину `title`
+- флаги короткого или длинного `title`
 - длину `meta description`
 - текст `meta description`
+- флаги короткого или длинного `meta description`
 - директивы `meta robots`
 - флаги `noindex` и `nofollow`
+- `lang` страницы
+- количество `hreflang`
+- флаги наличия `og:title`, `og:description`, `og:image`, `twitter:card`
 - `canonical URL`
 - флаг несоответствия `canonical` итоговому URL
 - количество тегов `H1`
@@ -110,7 +118,10 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - сколько страниц было обойдено
 - сколько найдено битых ссылок
 - сколько страниц без `title`, `meta description`, `H1`
+- сколько страниц без `lang`
+- сколько страниц с коротким или длинным `title` и `meta description`
 - сколько страниц с дублирующимся `title` и `meta description`
+- сколько страниц без Open Graph и Twitter meta-тегов
 - сколько страниц отмечены `noindex` и `nofollow`
 - сколько страниц имеют `canonical mismatch`
 - доступны ли `robots.txt` и sitemap

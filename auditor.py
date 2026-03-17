@@ -118,27 +118,31 @@ def build_absolute_asset_url(base_url: str, asset_url: str) -> str:
     return normalize_url(absolute_url) or absolute_url
 
 
+def get_meta_content(soup: BeautifulSoup, attr_name: str, attr_value: str) -> str:
+    tag = soup.find(
+        "meta",
+        attrs={attr_name: lambda value: isinstance(value, str) and value.lower() == attr_value.lower()},
+    )
+    if not tag:
+        return ""
+    return tag.get("content", "").strip()
+
+
 def extract_page_data(html_content: str, base_url: str, domain: str) -> Dict[str, object]:
     soup = BeautifulSoup(html_content, "html.parser")
 
     title_tag = soup.find("title")
     title = title_tag.get_text(strip=True) if title_tag else ""
+    title_length = len(title)
 
-    meta_description_tag = soup.find(
-        "meta",
-        attrs={"name": lambda value: isinstance(value, str) and value.lower() == "description"},
-    )
-    meta_description = ""
-    if meta_description_tag:
-        meta_description = meta_description_tag.get("content", "").strip()
+    meta_description = get_meta_content(soup, "name", "description")
+    meta_description_length = len(meta_description)
 
-    robots_meta_tag = soup.find(
-        "meta",
-        attrs={"name": lambda value: isinstance(value, str) and value.lower() == "robots"},
-    )
-    robots_directives = ""
-    if robots_meta_tag:
-        robots_directives = robots_meta_tag.get("content", "").strip().lower()
+    robots_directives = get_meta_content(soup, "name", "robots").lower()
+    og_title = get_meta_content(soup, "property", "og:title")
+    og_description = get_meta_content(soup, "property", "og:description")
+    og_image = get_meta_content(soup, "property", "og:image")
+    twitter_card = get_meta_content(soup, "name", "twitter:card")
 
     canonical_tag = soup.find(
         "link",
@@ -149,7 +153,16 @@ def extract_page_data(html_content: str, base_url: str, domain: str) -> Dict[str
         canonical_candidate = urljoin(base_url, canonical_tag["href"])
         canonical_url = normalize_url(canonical_candidate) or canonical_candidate
 
+    html_tag = soup.find("html")
+    html_lang = ""
+    if html_tag:
+        html_lang = html_tag.get("lang", "").strip()
+
     h1_tags = soup.find_all("h1")
+    hreflang_tags = [
+        tag for tag in soup.find_all("link", href=True)
+        if tag.get("hreflang")
+    ]
     internal_links: Set[str] = set()
     image_issues: List[Dict[str, object]] = []
     images = soup.find_all("img")
@@ -190,11 +203,23 @@ def extract_page_data(html_content: str, base_url: str, domain: str) -> Dict[str
 
     return {
         "title": title,
+        "title_length": title_length,
         "meta_description": meta_description,
-        "meta_description_length": len(meta_description),
+        "meta_description_length": meta_description_length,
         "robots_directives": robots_directives,
         "noindex": "noindex" in robots_directives,
         "nofollow": "nofollow" in robots_directives,
+        "html_lang": html_lang,
+        "missing_lang": not bool(html_lang),
+        "hreflang_count": len(hreflang_tags),
+        "og_title_present": bool(og_title),
+        "og_description_present": bool(og_description),
+        "og_image_present": bool(og_image),
+        "twitter_card_present": bool(twitter_card),
+        "title_too_short": bool(title) and title_length < 30,
+        "title_too_long": title_length > 60,
+        "meta_description_too_short": bool(meta_description) and meta_description_length < 70,
+        "meta_description_too_long": meta_description_length > 160,
         "canonical_url": canonical_url,
         "h1_count": len(h1_tags),
         "images_count": len(images),
@@ -382,11 +407,33 @@ def build_summary_report(
             "value": sum(1 for page in pages_report if page["missing_meta_description"]),
         },
         {"metric": "pages_missing_h1", "value": sum(1 for page in pages_report if page["missing_h1"])},
+        {"metric": "pages_missing_lang", "value": sum(1 for page in pages_report if page["missing_lang"])},
+        {"metric": "pages_with_short_title", "value": sum(1 for page in pages_report if page["title_too_short"])},
+        {"metric": "pages_with_long_title", "value": sum(1 for page in pages_report if page["title_too_long"])},
+        {
+            "metric": "pages_with_short_meta_description",
+            "value": sum(1 for page in pages_report if page["meta_description_too_short"]),
+        },
+        {
+            "metric": "pages_with_long_meta_description",
+            "value": sum(1 for page in pages_report if page["meta_description_too_long"]),
+        },
         {"metric": "pages_with_duplicate_title", "value": sum(1 for page in pages_report if page["duplicate_title"])},
         {
             "metric": "pages_with_duplicate_meta_description",
             "value": sum(1 for page in pages_report if page["duplicate_meta_description"]),
         },
+        {"metric": "pages_missing_og_title", "value": sum(1 for page in pages_report if not page["og_title_present"])},
+        {
+            "metric": "pages_missing_og_description",
+            "value": sum(1 for page in pages_report if not page["og_description_present"]),
+        },
+        {"metric": "pages_missing_og_image", "value": sum(1 for page in pages_report if not page["og_image_present"])},
+        {
+            "metric": "pages_missing_twitter_card",
+            "value": sum(1 for page in pages_report if not page["twitter_card_present"]),
+        },
+        {"metric": "pages_with_hreflang", "value": sum(1 for page in pages_report if page["hreflang_count"] > 0)},
         {"metric": "pages_with_noindex", "value": sum(1 for page in pages_report if page["noindex"])},
         {"metric": "pages_with_nofollow", "value": sum(1 for page in pages_report if page["nofollow"])},
         {"metric": "pages_with_redirects", "value": sum(1 for page in pages_report if page["redirect_count"] > 0)},
@@ -424,11 +471,23 @@ def write_pages_report(pages: List[Dict[str, object]]) -> None:
                 "response_time_ms",
                 "redirect_count",
                 "title",
+                "title_length",
+                "title_too_short",
+                "title_too_long",
                 "meta_description_length",
                 "meta_description",
+                "meta_description_too_short",
+                "meta_description_too_long",
                 "robots_directives",
                 "noindex",
                 "nofollow",
+                "html_lang",
+                "missing_lang",
+                "hreflang_count",
+                "og_title_present",
+                "og_description_present",
+                "og_image_present",
+                "twitter_card_present",
                 "canonical_url",
                 "canonical_mismatch",
                 "h1_count",
@@ -452,11 +511,23 @@ def write_pages_report(pages: List[Dict[str, object]]) -> None:
                     page["response_time_ms"],
                     page["redirect_count"],
                     page["title"],
+                    page["title_length"],
+                    page["title_too_short"],
+                    page["title_too_long"],
                     page["meta_description_length"],
                     page["meta_description"],
+                    page["meta_description_too_short"],
+                    page["meta_description_too_long"],
                     page["robots_directives"],
                     page["noindex"],
                     page["nofollow"],
+                    page["html_lang"],
+                    page["missing_lang"],
+                    page["hreflang_count"],
+                    page["og_title_present"],
+                    page["og_description_present"],
+                    page["og_image_present"],
+                    page["twitter_card_present"],
                     page["canonical_url"],
                     page["canonical_mismatch"],
                     page["h1_count"],
@@ -584,6 +655,10 @@ def write_html_report(
             page["final_url"],
             page["status"],
             page["title"],
+            page["html_lang"],
+            page["hreflang_count"],
+            page["og_title_present"],
+            page["twitter_card_present"],
             page["images_count"],
             page["images_missing_alt"],
             page["images_empty_alt"],
@@ -756,7 +831,7 @@ def write_html_report(
     </section>
     <section class="section">
       <h2>Pages Overview</h2>
-      {render_table(["Final URL", "HTTP", "Title", "Images", "Missing alt", "Empty alt", "Canonical mismatch"], pages_rows)}
+      {render_table(["Final URL", "HTTP", "Title", "Lang", "hreflang", "OG title", "Twitter card", "Images", "Missing alt", "Empty alt", "Canonical mismatch"], pages_rows)}
     </section>
     <section class="section">
       <h2>Broken Links</h2>
@@ -793,11 +868,23 @@ def append_failed_page(
             "response_time_ms": response_time_ms,
             "redirect_count": 0,
             "title": "",
+            "title_length": 0,
+            "title_too_short": False,
+            "title_too_long": False,
             "meta_description_length": 0,
             "meta_description": "",
+            "meta_description_too_short": False,
+            "meta_description_too_long": False,
             "robots_directives": "",
             "noindex": False,
             "nofollow": False,
+            "html_lang": "",
+            "missing_lang": True,
+            "hreflang_count": 0,
+            "og_title_present": False,
+            "og_description_present": False,
+            "og_image_present": False,
+            "twitter_card_present": False,
             "canonical_url": "",
             "canonical_mismatch": False,
             "h1_count": 0,
@@ -824,8 +911,17 @@ def print_summary(
     title_issues = sum(1 for page in pages_report if page["missing_title"])
     meta_issues = sum(1 for page in pages_report if page["missing_meta_description"])
     h1_issues = sum(1 for page in pages_report if page["missing_h1"])
+    lang_issues = sum(1 for page in pages_report if page["missing_lang"])
+    short_titles = sum(1 for page in pages_report if page["title_too_short"])
+    long_titles = sum(1 for page in pages_report if page["title_too_long"])
+    short_meta = sum(1 for page in pages_report if page["meta_description_too_short"])
+    long_meta = sum(1 for page in pages_report if page["meta_description_too_long"])
     duplicate_titles = sum(1 for page in pages_report if page["duplicate_title"])
     duplicate_meta_descriptions = sum(1 for page in pages_report if page["duplicate_meta_description"])
+    missing_og_title = sum(1 for page in pages_report if not page["og_title_present"])
+    missing_og_description = sum(1 for page in pages_report if not page["og_description_present"])
+    missing_og_image = sum(1 for page in pages_report if not page["og_image_present"])
+    missing_twitter_card = sum(1 for page in pages_report if not page["twitter_card_present"])
     noindex_pages = sum(1 for page in pages_report if page["noindex"])
     nofollow_pages = sum(1 for page in pages_report if page["nofollow"])
     canonical_mismatches = sum(1 for page in pages_report if page["canonical_mismatch"])
@@ -837,8 +933,16 @@ def print_summary(
 
     print(
         f"[SUMMARY] Без title: {title_issues}, без meta description: {meta_issues}, "
-        f"без H1: {h1_issues}, с дубликатом title: {duplicate_titles}, "
+        f"без H1: {h1_issues}, без lang: {lang_issues}, с дубликатом title: {duplicate_titles}, "
         f"с дубликатом meta description: {duplicate_meta_descriptions}"
+    )
+    print(
+        f"[SUMMARY] Короткий title: {short_titles}, длинный title: {long_titles}, "
+        f"короткий meta description: {short_meta}, длинный meta description: {long_meta}"
+    )
+    print(
+        f"[SUMMARY] Без og:title: {missing_og_title}, без og:description: {missing_og_description}, "
+        f"без og:image: {missing_og_image}, без twitter:card: {missing_twitter_card}"
     )
     print(
         f"[SUMMARY] Страниц с noindex: {noindex_pages}, с nofollow: {nofollow_pages}, "
@@ -932,11 +1036,23 @@ def audit_website(
                         "response_time_ms": elapsed_ms,
                         "redirect_count": redirect_count,
                         "title": "",
+                        "title_length": 0,
+                        "title_too_short": False,
+                        "title_too_long": False,
                         "meta_description_length": 0,
                         "meta_description": "",
+                        "meta_description_too_short": False,
+                        "meta_description_too_long": False,
                         "robots_directives": "",
                         "noindex": False,
                         "nofollow": False,
+                        "html_lang": "",
+                        "missing_lang": True,
+                        "hreflang_count": 0,
+                        "og_title_present": False,
+                        "og_description_present": False,
+                        "og_image_present": False,
+                        "twitter_card_present": False,
                         "canonical_url": "",
                         "canonical_mismatch": False,
                         "h1_count": 0,
@@ -978,11 +1094,23 @@ def audit_website(
                     "response_time_ms": elapsed_ms,
                     "redirect_count": redirect_count,
                     "title": page_data["title"],
+                    "title_length": page_data["title_length"],
+                    "title_too_short": page_data["title_too_short"],
+                    "title_too_long": page_data["title_too_long"],
                     "meta_description_length": page_data["meta_description_length"],
                     "meta_description": page_data["meta_description"],
+                    "meta_description_too_short": page_data["meta_description_too_short"],
+                    "meta_description_too_long": page_data["meta_description_too_long"],
                     "robots_directives": page_data["robots_directives"],
                     "noindex": page_data["noindex"],
                     "nofollow": page_data["nofollow"],
+                    "html_lang": page_data["html_lang"],
+                    "missing_lang": page_data["missing_lang"],
+                    "hreflang_count": page_data["hreflang_count"],
+                    "og_title_present": page_data["og_title_present"],
+                    "og_description_present": page_data["og_description_present"],
+                    "og_image_present": page_data["og_image_present"],
+                    "twitter_card_present": page_data["twitter_card_present"],
                     "canonical_url": page_data["canonical_url"],
                     "canonical_mismatch": canonical_mismatch,
                     "h1_count": page_data["h1_count"],
