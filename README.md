@@ -12,12 +12,14 @@
 - извлекает содержимое тега `<title>`
 - оценивает базовые SEO-сигналы: `meta description`, `canonical`, наличие `H1`, дубликаты `title` и `meta description`
 - определяет директивы `noindex` и `nofollow` из `meta robots`
+- помечает страницы, где `canonical` не совпадает с итоговым URL
 - находит внутренние ссылки на странице
 - продолжает обход страниц того же домена
 - фиксирует битые ссылки, если запрос не удался или сервер вернул код `400+`
 - повторяет нестабильные запросы при временных ошибках сервера
 - проверяет наличие и доступность `robots.txt` и `sitemap.xml`
-- сохраняет результаты в `pages_report.csv`, `broken_links_report.csv`, `site_report.csv` и `summary_report.csv`
+- ищет orphan-страницы: URL из sitemap, которые не попали в обход
+- сохраняет результаты в `pages_report.csv`, `broken_links_report.csv`, `site_report.csv`, `summary_report.csv` и `orphan_pages_report.csv`
 
 ## Используемые технологии
 
@@ -72,6 +74,7 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - директивы `meta robots`
 - флаги `noindex` и `nofollow`
 - `canonical URL`
+- флаг несоответствия `canonical` итоговому URL
 - количество тегов `H1`
 - количество найденных внутренних ссылок
 - флаги проблем: отсутствует `title`, `meta description`, `H1` или найдены дубликаты `title`/`meta description`
@@ -93,6 +96,7 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - признак наличия `robots.txt`
 - URL и статус `sitemap.xml` или sitemap из `robots.txt`
 - признак наличия sitemap
+- количество URL, найденных в sitemap
 
 ### `summary_report.csv`
 
@@ -103,4 +107,14 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - сколько страниц без `title`, `meta description`, `H1`
 - сколько страниц с дублирующимся `title` и `meta description`
 - сколько страниц отмечены `noindex` и `nofollow`
+- сколько страниц имеют `canonical mismatch`
 - доступны ли `robots.txt` и sitemap
+- сколько URL найдено в sitemap и сколько orphan-страниц обнаружено
+
+### `orphan_pages_report.csv`
+
+Содержит:
+
+- URL страницы из sitemap
+- признак наличия URL в sitemap
+- признак того, что страница не была обойдена краулером

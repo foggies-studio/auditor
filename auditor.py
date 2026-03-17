@@ -2,6 +2,7 @@ import argparse
 import csv
 import time
 import warnings
+import xml.etree.ElementTree as ET
 from collections import Counter, deque
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urldefrag, urljoin, urlparse
@@ -18,6 +19,7 @@ PAGES_REPORT_FILE = "pages_report.csv"
 BROKEN_LINKS_REPORT_FILE = "broken_links_report.csv"
 SITE_REPORT_FILE = "site_report.csv"
 SUMMARY_REPORT_FILE = "summary_report.csv"
+ORPHAN_PAGES_REPORT_FILE = "orphan_pages_report.csv"
 REQUEST_FAILED_STATUS = "REQUEST_FAILED"
 
 
@@ -218,7 +220,14 @@ def inspect_site_resources(
                     sitemap_url = normalized_candidate
                     break
 
-    sitemap_status, sitemap_present, _ = inspect_resource(session, sitemap_url, timeout)
+    sitemap_status, sitemap_present, sitemap_content = inspect_resource(session, sitemap_url, timeout)
+    sitemap_urls = extract_sitemap_urls(
+        session=session,
+        sitemap_url=sitemap_url,
+        sitemap_content=sitemap_content,
+        timeout=timeout,
+        visited_sitemaps=set(),
+    ) if sitemap_present else set()
 
     return {
         "site_root": site_root,
@@ -228,7 +237,64 @@ def inspect_site_resources(
         "sitemap_url": sitemap_url,
         "sitemap_status": sitemap_status,
         "sitemap_present": sitemap_present,
+        "sitemap_urls": sitemap_urls,
+        "sitemap_urls_count": len(sitemap_urls),
     }
+
+
+def extract_sitemap_urls(
+    session: requests.Session,
+    sitemap_url: str,
+    sitemap_content: str,
+    timeout: int,
+    visited_sitemaps: Set[str],
+) -> Set[str]:
+    normalized_sitemap_url = normalize_url(sitemap_url) or sitemap_url
+    if normalized_sitemap_url in visited_sitemaps:
+        return set()
+
+    visited_sitemaps.add(normalized_sitemap_url)
+
+    try:
+        root = ET.fromstring(sitemap_content)
+    except ET.ParseError:
+        return set()
+
+    urls: Set[str] = set()
+    root_tag = root.tag.lower()
+
+    if root_tag.endswith("urlset"):
+        for element in root.iter():
+            if element.tag.lower().endswith("loc") and element.text:
+                normalized_url = normalize_url(element.text)
+                if normalized_url:
+                    urls.add(normalized_url)
+        return urls
+
+    if root_tag.endswith("sitemapindex"):
+        for element in root.iter():
+            if not element.tag.lower().endswith("loc") or not element.text:
+                continue
+
+            nested_sitemap_url = normalize_url(element.text)
+            if not nested_sitemap_url:
+                continue
+
+            _, is_present, nested_content = inspect_resource(session, nested_sitemap_url, timeout)
+            if not is_present:
+                continue
+
+            urls.update(
+                extract_sitemap_urls(
+                    session=session,
+                    sitemap_url=nested_sitemap_url,
+                    sitemap_content=nested_content,
+                    timeout=timeout,
+                    visited_sitemaps=visited_sitemaps,
+                )
+            )
+
+    return urls
 
 
 def annotate_duplicate_titles(pages_report: List[Dict[str, object]]) -> None:
@@ -259,6 +325,7 @@ def build_summary_report(
     pages_report: List[Dict[str, object]],
     broken_links_report: List[Dict[str, object]],
     site_report: Dict[str, object],
+    orphan_pages_report: List[Dict[str, object]],
 ) -> List[Dict[str, object]]:
     return [
         {"metric": "pages_crawled", "value": len(pages_report)},
@@ -277,8 +344,14 @@ def build_summary_report(
         {"metric": "pages_with_noindex", "value": sum(1 for page in pages_report if page["noindex"])},
         {"metric": "pages_with_nofollow", "value": sum(1 for page in pages_report if page["nofollow"])},
         {"metric": "pages_with_redirects", "value": sum(1 for page in pages_report if page["redirect_count"] > 0)},
+        {
+            "metric": "pages_with_canonical_mismatch",
+            "value": sum(1 for page in pages_report if page["canonical_mismatch"]),
+        },
         {"metric": "robots_txt_present", "value": site_report["robots_present"]},
         {"metric": "sitemap_present", "value": site_report["sitemap_present"]},
+        {"metric": "sitemap_urls_total", "value": site_report["sitemap_urls_count"]},
+        {"metric": "orphan_pages_found", "value": len(orphan_pages_report)},
     ]
 
 
@@ -299,6 +372,7 @@ def write_pages_report(pages: List[Dict[str, object]]) -> None:
                 "noindex",
                 "nofollow",
                 "canonical_url",
+                "canonical_mismatch",
                 "h1_count",
                 "internal_links_count",
                 "missing_title",
@@ -323,6 +397,7 @@ def write_pages_report(pages: List[Dict[str, object]]) -> None:
                     page["noindex"],
                     page["nofollow"],
                     page["canonical_url"],
+                    page["canonical_mismatch"],
                     page["h1_count"],
                     page["internal_links_count"],
                     page["missing_title"],
@@ -354,6 +429,7 @@ def write_site_report(site_report: Dict[str, object]) -> None:
                 "sitemap_url",
                 "sitemap_status",
                 "sitemap_present",
+                "sitemap_urls_count",
             ]
         )
         writer.writerow(
@@ -365,6 +441,7 @@ def write_site_report(site_report: Dict[str, object]) -> None:
                 site_report["sitemap_url"],
                 site_report["sitemap_status"],
                 site_report["sitemap_present"],
+                site_report["sitemap_urls_count"],
             ]
         )
 
@@ -375,6 +452,14 @@ def write_summary_report(summary_report: List[Dict[str, object]]) -> None:
         writer.writerow(["metric", "value"])
         for item in summary_report:
             writer.writerow([item["metric"], item["value"]])
+
+
+def write_orphan_pages_report(orphan_pages_report: List[Dict[str, object]]) -> None:
+    with open(ORPHAN_PAGES_REPORT_FILE, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(["sitemap_url", "in_sitemap", "crawled"])
+        for item in orphan_pages_report:
+            writer.writerow([item["sitemap_url"], item["in_sitemap"], item["crawled"]])
 
 
 def append_failed_page(
@@ -397,6 +482,7 @@ def append_failed_page(
             "noindex": False,
             "nofollow": False,
             "canonical_url": "",
+            "canonical_mismatch": False,
             "h1_count": 0,
             "internal_links_count": 0,
             "missing_title": True,
@@ -412,6 +498,7 @@ def print_summary(
     pages_report: List[Dict[str, object]],
     broken_links_report: List[Dict[str, object]],
     site_report: Dict[str, object],
+    orphan_pages_report: List[Dict[str, object]],
 ) -> None:
     title_issues = sum(1 for page in pages_report if page["missing_title"])
     meta_issues = sum(1 for page in pages_report if page["missing_meta_description"])
@@ -420,6 +507,7 @@ def print_summary(
     duplicate_meta_descriptions = sum(1 for page in pages_report if page["duplicate_meta_description"])
     noindex_pages = sum(1 for page in pages_report if page["noindex"])
     nofollow_pages = sum(1 for page in pages_report if page["nofollow"])
+    canonical_mismatches = sum(1 for page in pages_report if page["canonical_mismatch"])
     redirects = sum(1 for page in pages_report if page["redirect_count"] > 0)
     status_counter = Counter(str(item["status"]) for item in broken_links_report)
 
@@ -430,13 +518,14 @@ def print_summary(
     )
     print(
         f"[SUMMARY] Страниц с noindex: {noindex_pages}, с nofollow: {nofollow_pages}, "
-        f"страниц с редиректами: {redirects}"
+        f"с canonical mismatch: {canonical_mismatches}, страниц с редиректами: {redirects}"
     )
     print(
         f"[SUMMARY] robots.txt: {site_report['robots_status']} "
         f"({ 'найден' if site_report['robots_present'] else 'не найден' }), "
         f"sitemap: {site_report['sitemap_status']} "
-        f"({ 'найден' if site_report['sitemap_present'] else 'не найден' })"
+        f"({ 'найден' if site_report['sitemap_present'] else 'не найден' }), "
+        f"URL в sitemap: {site_report['sitemap_urls_count']}, orphan pages: {len(orphan_pages_report)}"
     )
     if status_counter:
         formatted = ", ".join(f"{status}: {count}" for status, count in sorted(status_counter.items()))
@@ -448,7 +537,7 @@ def audit_website(
     max_pages: int,
     timeout: int,
     allow_insecure: bool,
-) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], Dict[str, object]]:
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], Dict[str, object], List[Dict[str, object]]]:
     normalized_start_url = normalize_url(start_url)
     if not normalized_start_url:
         raise ValueError("Стартовый URL должен быть абсолютным HTTP(S)-адресом.")
@@ -514,6 +603,7 @@ def audit_website(
                         "noindex": False,
                         "nofollow": False,
                         "canonical_url": "",
+                        "canonical_mismatch": False,
                         "h1_count": 0,
                         "internal_links_count": 0,
                         "missing_title": True,
@@ -527,6 +617,7 @@ def audit_website(
 
             page_data = extract_page_data(response.text, final_url, domain)
             internal_links = page_data["internal_links"]
+            canonical_mismatch = bool(page_data["canonical_url"]) and page_data["canonical_url"] != final_url
             print(
                 f"[INFO] HTTP {response.status_code}, {elapsed_ms} мс, "
                 f"редиректов: {redirect_count}, внутренних ссылок: {len(internal_links)}"
@@ -546,6 +637,7 @@ def audit_website(
                     "noindex": page_data["noindex"],
                     "nofollow": page_data["nofollow"],
                     "canonical_url": page_data["canonical_url"],
+                    "canonical_mismatch": canonical_mismatch,
                     "h1_count": page_data["h1_count"],
                     "internal_links_count": len(internal_links),
                     "missing_title": page_data["missing_title"],
@@ -573,24 +665,36 @@ def audit_website(
 
     annotate_duplicate_titles(pages_report)
     annotate_duplicate_meta_descriptions(pages_report)
-    return pages_report, broken_links_report, site_report
+    crawled_urls = {str(page["final_url"]) for page in pages_report}
+    orphan_pages_report = [
+        {"sitemap_url": url, "in_sitemap": True, "crawled": False}
+        for url in sorted(site_report["sitemap_urls"])
+        if url not in crawled_urls
+    ]
+    return pages_report, broken_links_report, site_report, orphan_pages_report
 
 
 def main() -> None:
     args = parse_args()
 
     try:
-        pages_report, broken_links_report, site_report = audit_website(
+        pages_report, broken_links_report, site_report, orphan_pages_report = audit_website(
             args.start_url,
             args.max_pages,
             args.timeout,
             args.allow_insecure,
         )
-        summary_report = build_summary_report(pages_report, broken_links_report, site_report)
+        summary_report = build_summary_report(
+            pages_report,
+            broken_links_report,
+            site_report,
+            orphan_pages_report,
+        )
         write_pages_report(pages_report)
         write_broken_links_report(broken_links_report)
         write_site_report(site_report)
         write_summary_report(summary_report)
+        write_orphan_pages_report(orphan_pages_report)
     except ValueError as exc:
         print(f"[ERROR] {exc}")
         raise SystemExit(1) from exc
@@ -609,7 +713,8 @@ def main() -> None:
     print(f"[DONE] Отчёт по битым ссылкам: {BROKEN_LINKS_REPORT_FILE}")
     print(f"[DONE] Отчёт по сайту: {SITE_REPORT_FILE}")
     print(f"[DONE] Сводный отчёт: {SUMMARY_REPORT_FILE}")
-    print_summary(pages_report, broken_links_report, site_report)
+    print(f"[DONE] Отчёт по orphan-страницам: {ORPHAN_PAGES_REPORT_FILE}")
+    print_summary(pages_report, broken_links_report, site_report, orphan_pages_report)
 
 
 if __name__ == "__main__":
