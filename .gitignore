@@ -4,3 +4,4 @@ __pycache__/
 pages_report.csv
 broken_links_report.csv
 site_report.csv
+summary_report.csv

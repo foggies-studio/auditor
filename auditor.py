@@ -17,6 +17,7 @@ REQUEST_TIMEOUT = 10
 PAGES_REPORT_FILE = "pages_report.csv"
 BROKEN_LINKS_REPORT_FILE = "broken_links_report.csv"
 SITE_REPORT_FILE = "site_report.csv"
+SUMMARY_REPORT_FILE = "summary_report.csv"
 REQUEST_FAILED_STATUS = "REQUEST_FAILED"
 
 
@@ -114,6 +115,14 @@ def extract_page_data(html: str, base_url: str, domain: str) -> Dict[str, object
     if meta_description_tag:
         meta_description = meta_description_tag.get("content", "").strip()
 
+    robots_meta_tag = soup.find(
+        "meta",
+        attrs={"name": lambda value: isinstance(value, str) and value.lower() == "robots"},
+    )
+    robots_directives = ""
+    if robots_meta_tag:
+        robots_directives = robots_meta_tag.get("content", "").strip().lower()
+
     canonical_tag = soup.find(
         "link",
         rel=lambda value: isinstance(value, str) and "canonical" in value.lower(),
@@ -140,6 +149,9 @@ def extract_page_data(html: str, base_url: str, domain: str) -> Dict[str, object
         "title": title,
         "meta_description": meta_description,
         "meta_description_length": len(meta_description),
+        "robots_directives": robots_directives,
+        "noindex": "noindex" in robots_directives,
+        "nofollow": "nofollow" in robots_directives,
         "canonical_url": canonical_url,
         "h1_count": len(h1_tags),
         "internal_links": internal_links,
@@ -230,6 +242,46 @@ def annotate_duplicate_titles(pages_report: List[Dict[str, object]]) -> None:
         page["duplicate_title"] = bool(normalized_title) and title_counts[normalized_title] > 1
 
 
+def annotate_duplicate_meta_descriptions(pages_report: List[Dict[str, object]]) -> None:
+    description_counts = Counter(
+        str(page["meta_description"]).strip().lower()
+        for page in pages_report
+        if str(page["meta_description"]).strip()
+    )
+    for page in pages_report:
+        normalized_description = str(page["meta_description"]).strip().lower()
+        page["duplicate_meta_description"] = (
+            bool(normalized_description) and description_counts[normalized_description] > 1
+        )
+
+
+def build_summary_report(
+    pages_report: List[Dict[str, object]],
+    broken_links_report: List[Dict[str, object]],
+    site_report: Dict[str, object],
+) -> List[Dict[str, object]]:
+    return [
+        {"metric": "pages_crawled", "value": len(pages_report)},
+        {"metric": "broken_links_found", "value": len(broken_links_report)},
+        {"metric": "pages_missing_title", "value": sum(1 for page in pages_report if page["missing_title"])},
+        {
+            "metric": "pages_missing_meta_description",
+            "value": sum(1 for page in pages_report if page["missing_meta_description"]),
+        },
+        {"metric": "pages_missing_h1", "value": sum(1 for page in pages_report if page["missing_h1"])},
+        {"metric": "pages_with_duplicate_title", "value": sum(1 for page in pages_report if page["duplicate_title"])},
+        {
+            "metric": "pages_with_duplicate_meta_description",
+            "value": sum(1 for page in pages_report if page["duplicate_meta_description"]),
+        },
+        {"metric": "pages_with_noindex", "value": sum(1 for page in pages_report if page["noindex"])},
+        {"metric": "pages_with_nofollow", "value": sum(1 for page in pages_report if page["nofollow"])},
+        {"metric": "pages_with_redirects", "value": sum(1 for page in pages_report if page["redirect_count"] > 0)},
+        {"metric": "robots_txt_present", "value": site_report["robots_present"]},
+        {"metric": "sitemap_present", "value": site_report["sitemap_present"]},
+    ]
+
+
 def write_pages_report(pages: List[Dict[str, object]]) -> None:
     with open(PAGES_REPORT_FILE, "w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
@@ -242,6 +294,10 @@ def write_pages_report(pages: List[Dict[str, object]]) -> None:
                 "redirect_count",
                 "title",
                 "meta_description_length",
+                "meta_description",
+                "robots_directives",
+                "noindex",
+                "nofollow",
                 "canonical_url",
                 "h1_count",
                 "internal_links_count",
@@ -249,6 +305,7 @@ def write_pages_report(pages: List[Dict[str, object]]) -> None:
                 "missing_meta_description",
                 "missing_h1",
                 "duplicate_title",
+                "duplicate_meta_description",
             ]
         )
         for page in pages:
@@ -261,6 +318,10 @@ def write_pages_report(pages: List[Dict[str, object]]) -> None:
                     page["redirect_count"],
                     page["title"],
                     page["meta_description_length"],
+                    page["meta_description"],
+                    page["robots_directives"],
+                    page["noindex"],
+                    page["nofollow"],
                     page["canonical_url"],
                     page["h1_count"],
                     page["internal_links_count"],
@@ -268,6 +329,7 @@ def write_pages_report(pages: List[Dict[str, object]]) -> None:
                     page["missing_meta_description"],
                     page["missing_h1"],
                     page["duplicate_title"],
+                    page["duplicate_meta_description"],
                 ]
             )
 
@@ -307,6 +369,14 @@ def write_site_report(site_report: Dict[str, object]) -> None:
         )
 
 
+def write_summary_report(summary_report: List[Dict[str, object]]) -> None:
+    with open(SUMMARY_REPORT_FILE, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(["metric", "value"])
+        for item in summary_report:
+            writer.writerow([item["metric"], item["value"]])
+
+
 def append_failed_page(
     pages_report: List[Dict[str, object]],
     url: str,
@@ -322,6 +392,10 @@ def append_failed_page(
             "redirect_count": 0,
             "title": "",
             "meta_description_length": 0,
+            "meta_description": "",
+            "robots_directives": "",
+            "noindex": False,
+            "nofollow": False,
             "canonical_url": "",
             "h1_count": 0,
             "internal_links_count": 0,
@@ -329,6 +403,7 @@ def append_failed_page(
             "missing_meta_description": True,
             "missing_h1": True,
             "duplicate_title": False,
+            "duplicate_meta_description": False,
         }
     )
 
@@ -342,12 +417,20 @@ def print_summary(
     meta_issues = sum(1 for page in pages_report if page["missing_meta_description"])
     h1_issues = sum(1 for page in pages_report if page["missing_h1"])
     duplicate_titles = sum(1 for page in pages_report if page["duplicate_title"])
+    duplicate_meta_descriptions = sum(1 for page in pages_report if page["duplicate_meta_description"])
+    noindex_pages = sum(1 for page in pages_report if page["noindex"])
+    nofollow_pages = sum(1 for page in pages_report if page["nofollow"])
     redirects = sum(1 for page in pages_report if page["redirect_count"] > 0)
     status_counter = Counter(str(item["status"]) for item in broken_links_report)
 
     print(
         f"[SUMMARY] Без title: {title_issues}, без meta description: {meta_issues}, "
-        f"без H1: {h1_issues}, с дубликатом title: {duplicate_titles}, страниц с редиректами: {redirects}"
+        f"без H1: {h1_issues}, с дубликатом title: {duplicate_titles}, "
+        f"с дубликатом meta description: {duplicate_meta_descriptions}"
+    )
+    print(
+        f"[SUMMARY] Страниц с noindex: {noindex_pages}, с nofollow: {nofollow_pages}, "
+        f"страниц с редиректами: {redirects}"
     )
     print(
         f"[SUMMARY] robots.txt: {site_report['robots_status']} "
@@ -426,6 +509,10 @@ def audit_website(
                         "redirect_count": redirect_count,
                         "title": "",
                         "meta_description_length": 0,
+                        "meta_description": "",
+                        "robots_directives": "",
+                        "noindex": False,
+                        "nofollow": False,
                         "canonical_url": "",
                         "h1_count": 0,
                         "internal_links_count": 0,
@@ -433,6 +520,7 @@ def audit_website(
                         "missing_meta_description": True,
                         "missing_h1": True,
                         "duplicate_title": False,
+                        "duplicate_meta_description": False,
                     }
                 )
                 continue
@@ -453,6 +541,10 @@ def audit_website(
                     "redirect_count": redirect_count,
                     "title": page_data["title"],
                     "meta_description_length": page_data["meta_description_length"],
+                    "meta_description": page_data["meta_description"],
+                    "robots_directives": page_data["robots_directives"],
+                    "noindex": page_data["noindex"],
+                    "nofollow": page_data["nofollow"],
                     "canonical_url": page_data["canonical_url"],
                     "h1_count": page_data["h1_count"],
                     "internal_links_count": len(internal_links),
@@ -460,6 +552,7 @@ def audit_website(
                     "missing_meta_description": page_data["missing_meta_description"],
                     "missing_h1": page_data["missing_h1"],
                     "duplicate_title": False,
+                    "duplicate_meta_description": False,
                 }
             )
 
@@ -479,6 +572,7 @@ def audit_website(
                     queued_urls.append(link)
 
     annotate_duplicate_titles(pages_report)
+    annotate_duplicate_meta_descriptions(pages_report)
     return pages_report, broken_links_report, site_report
 
 
@@ -492,9 +586,11 @@ def main() -> None:
             args.timeout,
             args.allow_insecure,
         )
+        summary_report = build_summary_report(pages_report, broken_links_report, site_report)
         write_pages_report(pages_report)
         write_broken_links_report(broken_links_report)
         write_site_report(site_report)
+        write_summary_report(summary_report)
     except ValueError as exc:
         print(f"[ERROR] {exc}")
         raise SystemExit(1) from exc
@@ -512,6 +608,7 @@ def main() -> None:
     print(f"[DONE] Отчёт по страницам: {PAGES_REPORT_FILE}")
     print(f"[DONE] Отчёт по битым ссылкам: {BROKEN_LINKS_REPORT_FILE}")
     print(f"[DONE] Отчёт по сайту: {SITE_REPORT_FILE}")
+    print(f"[DONE] Сводный отчёт: {SUMMARY_REPORT_FILE}")
     print_summary(pages_report, broken_links_report, site_report)
 
 

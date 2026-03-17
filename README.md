@@ -10,13 +10,14 @@
 - определяет HTTP-статус ответа и время ответа сервера
 - отслеживает итоговый URL после редиректов и количество редиректов
 - извлекает содержимое тега `<title>`
-- оценивает базовые SEO-сигналы: `meta description`, `canonical`, наличие `H1`, дубликаты `title`
+- оценивает базовые SEO-сигналы: `meta description`, `canonical`, наличие `H1`, дубликаты `title` и `meta description`
+- определяет директивы `noindex` и `nofollow` из `meta robots`
 - находит внутренние ссылки на странице
 - продолжает обход страниц того же домена
 - фиксирует битые ссылки, если запрос не удался или сервер вернул код `400+`
 - повторяет нестабильные запросы при временных ошибках сервера
 - проверяет наличие и доступность `robots.txt` и `sitemap.xml`
-- сохраняет результаты в `pages_report.csv`, `broken_links_report.csv` и `site_report.csv`
+- сохраняет результаты в `pages_report.csv`, `broken_links_report.csv`, `site_report.csv` и `summary_report.csv`
 
 ## Используемые технологии
 
@@ -67,10 +68,13 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - количество редиректов
 - заголовок страницы
 - длину `meta description`
+- текст `meta description`
+- директивы `meta robots`
+- флаги `noindex` и `nofollow`
 - `canonical URL`
 - количество тегов `H1`
 - количество найденных внутренних ссылок
-- флаги проблем: отсутствует `title`, `meta description`, `H1` или найден дубликат `title`
+- флаги проблем: отсутствует `title`, `meta description`, `H1` или найдены дубликаты `title`/`meta description`
 
 ### `broken_links_report.csv`
 
@@ -89,3 +93,14 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - признак наличия `robots.txt`
 - URL и статус `sitemap.xml` или sitemap из `robots.txt`
 - признак наличия sitemap
+
+### `summary_report.csv`
+
+Содержит агрегированные метрики:
+
+- сколько страниц было обойдено
+- сколько найдено битых ссылок
+- сколько страниц без `title`, `meta description`, `H1`
+- сколько страниц с дублирующимся `title` и `meta description`
+- сколько страниц отмечены `noindex` и `nofollow`
+- доступны ли `robots.txt` и sitemap
