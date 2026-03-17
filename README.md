@@ -15,6 +15,7 @@
 - проверяет длину `title` и `meta description`
 - проверяет `lang`, `hreflang`, Open Graph и Twitter meta-теги
 - помечает страницы, где `canonical` не совпадает с итоговым URL
+- определяет внешний `canonical` и mixed content на HTTPS-страницах
 - проверяет изображения и находит `img` без `alt` или с пустым `alt`
 - находит внутренние ссылки на странице
 - продолжает обход страниц того же домена
@@ -23,7 +24,7 @@
 - проверяет наличие и доступность `robots.txt` и `sitemap.xml`
 - ищет orphan-страницы: URL из sitemap, которые не попали в обход
 - генерирует HTML-отчёт для просмотра результатов в браузере
-- сохраняет результаты в `pages_report.csv`, `broken_links_report.csv`, `site_report.csv`, `summary_report.csv`, `orphan_pages_report.csv`, `image_issues_report.csv` и `audit_report.html`
+- сохраняет результаты в `pages_report.csv`, `broken_links_report.csv`, `site_report.csv`, `summary_report.csv`, `orphan_pages_report.csv`, `image_issues_report.csv`, `issues_report.csv` и `audit_report.html`
 
 ## Используемые технологии
 
@@ -85,6 +86,8 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - флаги наличия `og:title`, `og:description`, `og:image`, `twitter:card`
 - `canonical URL`
 - флаг несоответствия `canonical` итоговому URL
+- флаг внешнего `canonical`
+- флаги mixed content и количество HTTP-ресурсов на HTTPS-странице
 - количество тегов `H1`
 - количество изображений на странице
 - количество изображений без `alt`
@@ -123,7 +126,8 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - сколько страниц с дублирующимся `title` и `meta description`
 - сколько страниц без Open Graph и Twitter meta-тегов
 - сколько страниц отмечены `noindex` и `nofollow`
-- сколько страниц имеют `canonical mismatch`
+- сколько страниц имеют `canonical mismatch` или внешний `canonical`
+- сколько страниц имеют mixed content и сколько HTTP-ресурсов найдено
 - доступны ли `robots.txt` и sitemap
 - сколько URL найдено в sitemap и сколько orphan-страниц обнаружено
 
@@ -144,12 +148,23 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - тип проблемы (`missing_alt` или `empty_alt`)
 - текущее значение `alt`
 
+### `issues_report.csv`
+
+Содержит единый список проблем:
+
+- уровень проблемы (`site`, `page`, `link`, `image`, `sitemap`)
+- источник проблемы
+- тип проблемы
+- severity
+- детали
+
 ### `audit_report.html`
 
 Содержит визуальный дашборд:
 
 - общую сводку метрик
 - таблицу страниц и SEO-флагов
+- единый список проблем
 - битые ссылки
 - проблемы изображений
 - orphan-страницы из sitemap
