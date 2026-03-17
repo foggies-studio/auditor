@@ -40,8 +40,14 @@
 ```text
 website-auditor/
 ├── auditor.py
+├── pyproject.toml
 ├── requirements.txt
-└── README.md
+├── website_auditor/
+│   ├── __init__.py
+│   └── cli.py
+├── tests/
+│   └── test_cli.py
+└── .github/workflows/ci.yml
 ```
 
 ## Установка зависимостей
@@ -50,6 +56,12 @@ website-auditor/
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+При желании можно установить проект как пакет:
+
+```bash
+pip install .
 ```
 
 ## Запуск программы
@@ -63,6 +75,26 @@ python auditor.py https://example.com --max-pages 10
 ```bash
 python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecure
 ```
+
+После установки через `pip install .` доступна и команда:
+
+```bash
+website-auditor https://example.com --max-pages 10
+```
+
+## Тесты
+
+```bash
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
+## CI
+
+В проект добавлен GitHub Actions workflow `.github/workflows/ci.yml`, который:
+
+- устанавливает зависимости
+- запускает unit tests
+- выполняет smoke-check CLI через `py_compile`
 
 ## Формат выходных файлов
 

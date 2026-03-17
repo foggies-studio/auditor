@@ -1,6 +1,9 @@
 .venv/
 __pycache__/
 *.pyc
+.coverage
+.pytest_cache/
+.mypy_cache/
 pages_report.csv
 broken_links_report.csv
 site_report.csv
