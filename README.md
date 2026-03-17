@@ -16,6 +16,8 @@
 - проверяет `lang`, `hreflang`, Open Graph и Twitter meta-теги
 - помечает страницы, где `canonical` не совпадает с итоговым URL
 - определяет внешний `canonical` и mixed content на HTTPS-страницах
+- определяет длинные цепочки редиректов и подозрение на soft 404
+- считает страницы без входящих внутренних ссылок внутри crawl-графа
 - проверяет изображения и находит `img` без `alt` или с пустым `alt`
 - находит внутренние ссылки на странице
 - продолжает обход страниц того же домена
@@ -24,7 +26,7 @@
 - проверяет наличие и доступность `robots.txt` и `sitemap.xml`
 - ищет orphan-страницы: URL из sitemap, которые не попали в обход
 - генерирует HTML-отчёт для просмотра результатов в браузере
-- сохраняет результаты в `pages_report.csv`, `broken_links_report.csv`, `site_report.csv`, `summary_report.csv`, `orphan_pages_report.csv`, `image_issues_report.csv`, `issues_report.csv` и `audit_report.html`
+- сохраняет результаты в `pages_report.csv`, `broken_links_report.csv`, `site_report.csv`, `summary_report.csv`, `orphan_pages_report.csv`, `image_issues_report.csv`, `issues_report.csv`, `audit_report.html` и `audit_report.json`
 
 ## Используемые технологии
 
@@ -87,7 +89,11 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - `canonical URL`
 - флаг несоответствия `canonical` итоговому URL
 - флаг внешнего `canonical`
+- флаг длинной цепочки редиректов
+- флаг подозрения на soft 404
 - флаги mixed content и количество HTTP-ресурсов на HTTPS-странице
+- количество входящих внутренних ссылок
+- флаг отсутствия входящих внутренних ссылок
 - количество тегов `H1`
 - количество изображений на странице
 - количество изображений без `alt`
@@ -127,7 +133,9 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - сколько страниц без Open Graph и Twitter meta-тегов
 - сколько страниц отмечены `noindex` и `nofollow`
 - сколько страниц имеют `canonical mismatch` или внешний `canonical`
+- сколько страниц имеют длинную цепочку редиректов или soft 404
 - сколько страниц имеют mixed content и сколько HTTP-ресурсов найдено
+- сколько страниц не имеют входящих внутренних ссылок внутри crawl-графа
 - доступны ли `robots.txt` и sitemap
 - сколько URL найдено в sitemap и сколько orphan-страниц обнаружено
 
@@ -157,6 +165,18 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - тип проблемы
 - severity
 - детали
+
+### `audit_report.json`
+
+Содержит полную структурированную выгрузку для CI и интеграций:
+
+- summary
+- site report
+- pages report
+- broken links
+- orphan pages
+- image issues
+- unified issues
 
 ### `audit_report.html`
 

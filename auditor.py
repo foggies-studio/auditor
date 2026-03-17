@@ -1,6 +1,7 @@
 import argparse
 import csv
 import html
+import json
 import time
 import warnings
 import xml.etree.ElementTree as ET
@@ -25,6 +26,7 @@ ORPHAN_PAGES_REPORT_FILE = "orphan_pages_report.csv"
 IMAGE_ISSUES_REPORT_FILE = "image_issues_report.csv"
 HTML_REPORT_FILE = "audit_report.html"
 ISSUES_REPORT_FILE = "issues_report.csv"
+JSON_REPORT_FILE = "audit_report.json"
 REQUEST_FAILED_STATUS = "REQUEST_FAILED"
 
 
@@ -129,6 +131,19 @@ def get_meta_content(soup: BeautifulSoup, attr_name: str, attr_value: str) -> st
     return tag.get("content", "").strip()
 
 
+def detect_soft_404(title: str, page_text: str) -> bool:
+    combined_text = f"{title} {page_text}".lower()
+    soft_404_patterns = [
+        "404",
+        "not found",
+        "page not found",
+        "does not exist",
+        "doesn't exist",
+        "no longer available",
+    ]
+    return any(pattern in combined_text for pattern in soft_404_patterns)
+
+
 def extract_page_data(html_content: str, base_url: str, domain: str) -> Dict[str, object]:
     soup = BeautifulSoup(html_content, "html.parser")
     parsed_base_url = urlparse(base_url)
@@ -162,6 +177,7 @@ def extract_page_data(html_content: str, base_url: str, domain: str) -> Dict[str
         html_lang = html_tag.get("lang", "").strip()
 
     h1_tags = soup.find_all("h1")
+    page_text = soup.get_text(" ", strip=True)[:4000]
     hreflang_tags = [
         tag for tag in soup.find_all("link", href=True)
         if tag.get("hreflang")
@@ -240,6 +256,7 @@ def extract_page_data(html_content: str, base_url: str, domain: str) -> Dict[str
         "external_canonical": external_canonical,
         "mixed_content_present": bool(mixed_content_resources),
         "mixed_content_count": len(mixed_content_resources),
+        "soft_404_suspected": detect_soft_404(title, page_text),
         "h1_count": len(h1_tags),
         "images_count": len(images),
         "images_missing_alt": sum(1 for issue in image_issues if issue["issue_type"] == "missing_alt"),
@@ -457,9 +474,15 @@ def build_summary_report(
         {"metric": "pages_with_noindex", "value": sum(1 for page in pages_report if page["noindex"])},
         {"metric": "pages_with_nofollow", "value": sum(1 for page in pages_report if page["nofollow"])},
         {"metric": "pages_with_redirects", "value": sum(1 for page in pages_report if page["redirect_count"] > 0)},
+        {"metric": "pages_with_long_redirect_chain", "value": sum(1 for page in pages_report if page["long_redirect_chain"])},
+        {"metric": "pages_with_soft_404", "value": sum(1 for page in pages_report if page["soft_404_suspected"])},
         {"metric": "pages_with_external_canonical", "value": sum(1 for page in pages_report if page["external_canonical"])},
         {"metric": "pages_with_mixed_content", "value": sum(1 for page in pages_report if page["mixed_content_present"])},
         {"metric": "mixed_content_resources_found", "value": sum(int(page["mixed_content_count"]) for page in pages_report)},
+        {
+            "metric": "pages_with_no_incoming_internal_links",
+            "value": sum(1 for page in pages_report if page["no_incoming_internal_links"]),
+        },
         {"metric": "images_found", "value": sum(int(page["images_count"]) for page in pages_report)},
         {"metric": "images_missing_alt", "value": sum(int(page["images_missing_alt"]) for page in pages_report)},
         {"metric": "images_empty_alt", "value": sum(int(page["images_empty_alt"]) for page in pages_report)},
@@ -554,6 +577,12 @@ def build_issues_report(
             add_issue("page", source, "canonical_mismatch", "medium", str(page["canonical_url"]))
         if page["external_canonical"]:
             add_issue("page", source, "external_canonical", "medium", str(page["canonical_url"]))
+        if page["long_redirect_chain"]:
+            add_issue("page", source, "long_redirect_chain", "medium", f"Redirect count: {page['redirect_count']}.")
+        if page["soft_404_suspected"]:
+            add_issue("page", source, "soft_404_suspected", "medium", "Page looks like a soft 404.")
+        if page["no_incoming_internal_links"]:
+            add_issue("page", source, "no_incoming_internal_links", "low", "No incoming internal links in crawl graph.")
         if page["mixed_content_present"]:
             add_issue(
                 "page",
@@ -605,9 +634,13 @@ def write_pages_report(pages: List[Dict[str, object]]) -> None:
                 "twitter_card_present",
                 "canonical_url",
                 "canonical_mismatch",
+                "long_redirect_chain",
+                "soft_404_suspected",
                 "external_canonical",
                 "mixed_content_present",
                 "mixed_content_count",
+                "incoming_internal_links",
+                "no_incoming_internal_links",
                 "h1_count",
                 "images_count",
                 "images_missing_alt",
@@ -648,9 +681,13 @@ def write_pages_report(pages: List[Dict[str, object]]) -> None:
                     page["twitter_card_present"],
                     page["canonical_url"],
                     page["canonical_mismatch"],
+                    page["long_redirect_chain"],
+                    page["soft_404_suspected"],
                     page["external_canonical"],
                     page["mixed_content_present"],
                     page["mixed_content_count"],
+                    page["incoming_internal_links"],
+                    page["no_incoming_internal_links"],
                     page["h1_count"],
                     page["images_count"],
                     page["images_missing_alt"],
@@ -749,6 +786,35 @@ def write_issues_report(issues_report: List[Dict[str, object]]) -> None:
             )
 
 
+def write_json_report(
+    start_url: str,
+    summary_report: List[Dict[str, object]],
+    site_report: Dict[str, object],
+    pages_report: List[Dict[str, object]],
+    broken_links_report: List[Dict[str, object]],
+    orphan_pages_report: List[Dict[str, object]],
+    image_issues_report: List[Dict[str, object]],
+    issues_report: List[Dict[str, object]],
+) -> None:
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "start_url": start_url,
+        "summary_report": summary_report,
+        "site_report": {
+            key: sorted(value) if isinstance(value, set) else value
+            for key, value in site_report.items()
+        },
+        "pages_report": pages_report,
+        "broken_links_report": broken_links_report,
+        "orphan_pages_report": orphan_pages_report,
+        "image_issues_report": image_issues_report,
+        "issues_report": issues_report,
+    }
+
+    with open(JSON_REPORT_FILE, "w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+
+
 def render_table(headers: List[str], rows: List[List[object]]) -> str:
     header_html = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
     body_rows = []
@@ -797,8 +863,11 @@ def write_html_report(
             page["hreflang_count"],
             page["og_title_present"],
             page["twitter_card_present"],
+            page["long_redirect_chain"],
+            page["soft_404_suspected"],
             page["mixed_content_present"],
             page["external_canonical"],
+            page["incoming_internal_links"],
             page["images_count"],
             page["images_missing_alt"],
             page["images_empty_alt"],
@@ -976,7 +1045,7 @@ def write_html_report(
     </section>
     <section class="section">
       <h2>Pages Overview</h2>
-      {render_table(["Final URL", "HTTP", "Title", "Lang", "hreflang", "OG title", "Twitter card", "Mixed content", "External canonical", "Images", "Missing alt", "Empty alt", "Canonical mismatch"], pages_rows)}
+      {render_table(["Final URL", "HTTP", "Title", "Lang", "hreflang", "OG title", "Twitter card", "Long redirect chain", "Soft 404", "Mixed content", "External canonical", "Incoming links", "Images", "Missing alt", "Empty alt", "Canonical mismatch"], pages_rows)}
     </section>
     <section class="section">
       <h2>Broken Links</h2>
@@ -1036,9 +1105,13 @@ def append_failed_page(
             "twitter_card_present": False,
             "canonical_url": "",
             "canonical_mismatch": False,
+            "long_redirect_chain": False,
+            "soft_404_suspected": False,
             "external_canonical": False,
             "mixed_content_present": False,
             "mixed_content_count": 0,
+            "incoming_internal_links": 0,
+            "no_incoming_internal_links": False,
             "h1_count": 0,
             "images_count": 0,
             "images_missing_alt": 0,
@@ -1077,9 +1150,12 @@ def print_summary(
     noindex_pages = sum(1 for page in pages_report if page["noindex"])
     nofollow_pages = sum(1 for page in pages_report if page["nofollow"])
     canonical_mismatches = sum(1 for page in pages_report if page["canonical_mismatch"])
+    long_redirect_chains = sum(1 for page in pages_report if page["long_redirect_chain"])
+    soft_404_pages = sum(1 for page in pages_report if page["soft_404_suspected"])
     external_canonicals = sum(1 for page in pages_report if page["external_canonical"])
     mixed_content_pages = sum(1 for page in pages_report if page["mixed_content_present"])
     mixed_content_resources = sum(int(page["mixed_content_count"]) for page in pages_report)
+    no_incoming_pages = sum(1 for page in pages_report if page["no_incoming_internal_links"])
     image_issues = len(image_issues_report)
     images_missing_alt = sum(int(page["images_missing_alt"]) for page in pages_report)
     images_empty_alt = sum(int(page["images_empty_alt"]) for page in pages_report)
@@ -1102,7 +1178,10 @@ def print_summary(
     print(
         f"[SUMMARY] Страниц с noindex: {noindex_pages}, с nofollow: {nofollow_pages}, "
         f"с canonical mismatch: {canonical_mismatches}, с external canonical: {external_canonicals}, "
-        f"страниц с редиректами: {redirects}"
+        f"страниц с редиректами: {redirects}, с длинной цепочкой редиректов: {long_redirect_chains}"
+    )
+    print(
+        f"[SUMMARY] Soft 404: {soft_404_pages}, без входящих внутренних ссылок: {no_incoming_pages}"
     )
     print(
         f"[SUMMARY] Проблем mixed content: страниц {mixed_content_pages}, ресурсов {mixed_content_resources}. "
@@ -1149,6 +1228,7 @@ def audit_website(
     pages_report: List[Dict[str, object]] = []
     broken_links_report: List[Dict[str, object]] = []
     image_issues_report: List[Dict[str, object]] = []
+    link_graph: Dict[str, Set[str]] = {}
     queued_urls = deque([normalized_start_url])
     visited_urls: Set[str] = set()
     discovered_urls: Set[str] = {normalized_start_url}
@@ -1211,9 +1291,13 @@ def audit_website(
                         "twitter_card_present": False,
                         "canonical_url": "",
                         "canonical_mismatch": False,
+                        "long_redirect_chain": False,
+                        "soft_404_suspected": False,
                         "external_canonical": False,
                         "mixed_content_present": False,
                         "mixed_content_count": 0,
+                        "incoming_internal_links": 0,
+                        "no_incoming_internal_links": False,
                         "h1_count": 0,
                         "images_count": 0,
                         "images_missing_alt": 0,
@@ -1230,7 +1314,9 @@ def audit_website(
 
             page_data = extract_page_data(response.text, final_url, domain)
             internal_links = page_data["internal_links"]
+            link_graph[current_url] = set(internal_links)
             canonical_mismatch = bool(page_data["canonical_url"]) and page_data["canonical_url"] != final_url
+            long_redirect_chain = redirect_count > 1
             for issue in page_data["image_issues"]:
                 image_issues_report.append(
                     {
@@ -1272,9 +1358,13 @@ def audit_website(
                     "twitter_card_present": page_data["twitter_card_present"],
                     "canonical_url": page_data["canonical_url"],
                     "canonical_mismatch": canonical_mismatch,
+                    "long_redirect_chain": long_redirect_chain,
+                    "soft_404_suspected": page_data["soft_404_suspected"],
                     "external_canonical": page_data["external_canonical"],
                     "mixed_content_present": page_data["mixed_content_present"],
                     "mixed_content_count": page_data["mixed_content_count"],
+                    "incoming_internal_links": 0,
+                    "no_incoming_internal_links": False,
                     "h1_count": page_data["h1_count"],
                     "images_count": page_data["images_count"],
                     "images_missing_alt": page_data["images_missing_alt"],
@@ -1305,6 +1395,14 @@ def audit_website(
 
     annotate_duplicate_titles(pages_report)
     annotate_duplicate_meta_descriptions(pages_report)
+    incoming_counts = Counter()
+    for targets in link_graph.values():
+        for target in targets:
+            incoming_counts[target] += 1
+    for page in pages_report:
+        incoming_internal_links = incoming_counts.get(str(page["url"]), 0)
+        page["incoming_internal_links"] = incoming_internal_links
+        page["no_incoming_internal_links"] = incoming_internal_links == 0 and str(page["url"]) != normalized_start_url
     crawled_urls = {str(page["final_url"]) for page in pages_report}
     orphan_pages_report = [
         {"sitemap_url": url, "in_sitemap": True, "crawled": False}
@@ -1345,6 +1443,16 @@ def main() -> None:
         write_orphan_pages_report(orphan_pages_report)
         write_image_issues_report(image_issues_report)
         write_issues_report(issues_report)
+        write_json_report(
+            args.start_url,
+            summary_report,
+            site_report,
+            pages_report,
+            broken_links_report,
+            orphan_pages_report,
+            image_issues_report,
+            issues_report,
+        )
         write_html_report(
             args.start_url,
             summary_report,
@@ -1376,6 +1484,7 @@ def main() -> None:
     print(f"[DONE] Отчёт по orphan-страницам: {ORPHAN_PAGES_REPORT_FILE}")
     print(f"[DONE] Отчёт по изображениям: {IMAGE_ISSUES_REPORT_FILE}")
     print(f"[DONE] Унифицированный отчёт по проблемам: {ISSUES_REPORT_FILE}")
+    print(f"[DONE] JSON-отчёт: {JSON_REPORT_FILE}")
     print(f"[DONE] HTML-отчёт: {HTML_REPORT_FILE}")
     print_summary(
         pages_report,
