@@ -10,12 +10,13 @@
 - определяет HTTP-статус ответа и время ответа сервера
 - отслеживает итоговый URL после редиректов и количество редиректов
 - извлекает содержимое тега `<title>`
-- оценивает базовые SEO-сигналы: `meta description`, `canonical`, наличие `H1`
+- оценивает базовые SEO-сигналы: `meta description`, `canonical`, наличие `H1`, дубликаты `title`
 - находит внутренние ссылки на странице
 - продолжает обход страниц того же домена
 - фиксирует битые ссылки, если запрос не удался или сервер вернул код `400+`
 - повторяет нестабильные запросы при временных ошибках сервера
-- сохраняет результаты в `pages_report.csv` и `broken_links_report.csv`
+- проверяет наличие и доступность `robots.txt` и `sitemap.xml`
+- сохраняет результаты в `pages_report.csv`, `broken_links_report.csv` и `site_report.csv`
 
 ## Используемые технологии
 
@@ -69,7 +70,7 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - `canonical URL`
 - количество тегов `H1`
 - количество найденных внутренних ссылок
-- флаги проблем: отсутствует `title`, `meta description` или `H1`
+- флаги проблем: отсутствует `title`, `meta description`, `H1` или найден дубликат `title`
 
 ### `broken_links_report.csv`
 
@@ -78,3 +79,13 @@ python auditor.py https://example.com --max-pages 20 --timeout 15 --allow-insecu
 - страницу, на которой найдена ссылка
 - битую ссылку
 - статус ответа или признак ошибки запроса
+
+### `site_report.csv`
+
+Содержит:
+
+- корневой адрес сайта
+- URL и статус `robots.txt`
+- признак наличия `robots.txt`
+- URL и статус `sitemap.xml` или sitemap из `robots.txt`
+- признак наличия sitemap

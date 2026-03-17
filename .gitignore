@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 pages_report.csv
 broken_links_report.csv
+site_report.csv

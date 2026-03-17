@@ -16,6 +16,7 @@ from urllib3.util.retry import Retry
 REQUEST_TIMEOUT = 10
 PAGES_REPORT_FILE = "pages_report.csv"
 BROKEN_LINKS_REPORT_FILE = "broken_links_report.csv"
+SITE_REPORT_FILE = "site_report.csv"
 REQUEST_FAILED_STATUS = "REQUEST_FAILED"
 
 
@@ -170,6 +171,65 @@ def get_link_status(
     return status_cache[url]
 
 
+def inspect_resource(
+    session: requests.Session,
+    url: str,
+    timeout: int,
+) -> Tuple[object, bool, str]:
+    response, error, _ = send_request(session, "GET", url, timeout)
+    if error:
+        return REQUEST_FAILED_STATUS, False, ""
+
+    is_present = response.status_code < 400
+    return response.status_code, is_present, response.text if is_present else ""
+
+
+def inspect_site_resources(
+    session: requests.Session,
+    start_url: str,
+    timeout: int,
+) -> Dict[str, object]:
+    parsed_start = urlparse(start_url)
+    site_root = f"{parsed_start.scheme}://{parsed_start.netloc}"
+    robots_url = f"{site_root}/robots.txt"
+    default_sitemap_url = f"{site_root}/sitemap.xml"
+
+    robots_status, robots_present, robots_content = inspect_resource(session, robots_url, timeout)
+
+    sitemap_url = default_sitemap_url
+    if robots_present:
+        for line in robots_content.splitlines():
+            if line.lower().startswith("sitemap:"):
+                candidate = line.split(":", 1)[1].strip()
+                normalized_candidate = normalize_url(candidate)
+                if normalized_candidate:
+                    sitemap_url = normalized_candidate
+                    break
+
+    sitemap_status, sitemap_present, _ = inspect_resource(session, sitemap_url, timeout)
+
+    return {
+        "site_root": site_root,
+        "robots_url": robots_url,
+        "robots_status": robots_status,
+        "robots_present": robots_present,
+        "sitemap_url": sitemap_url,
+        "sitemap_status": sitemap_status,
+        "sitemap_present": sitemap_present,
+    }
+
+
+def annotate_duplicate_titles(pages_report: List[Dict[str, object]]) -> None:
+    title_counts = Counter(
+        str(page["title"]).strip().lower()
+        for page in pages_report
+        if str(page["title"]).strip()
+    )
+    for page in pages_report:
+        normalized_title = str(page["title"]).strip().lower()
+        page["duplicate_title"] = bool(normalized_title) and title_counts[normalized_title] > 1
+
+
 def write_pages_report(pages: List[Dict[str, object]]) -> None:
     with open(PAGES_REPORT_FILE, "w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
@@ -188,6 +248,7 @@ def write_pages_report(pages: List[Dict[str, object]]) -> None:
                 "missing_title",
                 "missing_meta_description",
                 "missing_h1",
+                "duplicate_title",
             ]
         )
         for page in pages:
@@ -206,6 +267,7 @@ def write_pages_report(pages: List[Dict[str, object]]) -> None:
                     page["missing_title"],
                     page["missing_meta_description"],
                     page["missing_h1"],
+                    page["duplicate_title"],
                 ]
             )
 
@@ -216,6 +278,33 @@ def write_broken_links_report(broken_links: List[Dict[str, object]]) -> None:
         writer.writerow(["source_page", "broken_link", "status"])
         for item in broken_links:
             writer.writerow([item["source_page"], item["broken_link"], item["status"]])
+
+
+def write_site_report(site_report: Dict[str, object]) -> None:
+    with open(SITE_REPORT_FILE, "w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(
+            [
+                "site_root",
+                "robots_url",
+                "robots_status",
+                "robots_present",
+                "sitemap_url",
+                "sitemap_status",
+                "sitemap_present",
+            ]
+        )
+        writer.writerow(
+            [
+                site_report["site_root"],
+                site_report["robots_url"],
+                site_report["robots_status"],
+                site_report["robots_present"],
+                site_report["sitemap_url"],
+                site_report["sitemap_status"],
+                site_report["sitemap_present"],
+            ]
+        )
 
 
 def append_failed_page(
@@ -239,20 +328,32 @@ def append_failed_page(
             "missing_title": True,
             "missing_meta_description": True,
             "missing_h1": True,
+            "duplicate_title": False,
         }
     )
 
 
-def print_summary(pages_report: List[Dict[str, object]], broken_links_report: List[Dict[str, object]]) -> None:
+def print_summary(
+    pages_report: List[Dict[str, object]],
+    broken_links_report: List[Dict[str, object]],
+    site_report: Dict[str, object],
+) -> None:
     title_issues = sum(1 for page in pages_report if page["missing_title"])
     meta_issues = sum(1 for page in pages_report if page["missing_meta_description"])
     h1_issues = sum(1 for page in pages_report if page["missing_h1"])
+    duplicate_titles = sum(1 for page in pages_report if page["duplicate_title"])
     redirects = sum(1 for page in pages_report if page["redirect_count"] > 0)
     status_counter = Counter(str(item["status"]) for item in broken_links_report)
 
     print(
         f"[SUMMARY] Без title: {title_issues}, без meta description: {meta_issues}, "
-        f"без H1: {h1_issues}, страниц с редиректами: {redirects}"
+        f"без H1: {h1_issues}, с дубликатом title: {duplicate_titles}, страниц с редиректами: {redirects}"
+    )
+    print(
+        f"[SUMMARY] robots.txt: {site_report['robots_status']} "
+        f"({ 'найден' if site_report['robots_present'] else 'не найден' }), "
+        f"sitemap: {site_report['sitemap_status']} "
+        f"({ 'найден' if site_report['sitemap_present'] else 'не найден' })"
     )
     if status_counter:
         formatted = ", ".join(f"{status}: {count}" for status, count in sorted(status_counter.items()))
@@ -264,7 +365,7 @@ def audit_website(
     max_pages: int,
     timeout: int,
     allow_insecure: bool,
-) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], Dict[str, object]]:
     normalized_start_url = normalize_url(start_url)
     if not normalized_start_url:
         raise ValueError("Стартовый URL должен быть абсолютным HTTP(S)-адресом.")
@@ -287,6 +388,8 @@ def audit_website(
     status_cache: Dict[str, Tuple[Optional[int], bool]] = {}
 
     with create_session(allow_insecure) as session:
+        site_report = inspect_site_resources(session, normalized_start_url, timeout)
+
         while queued_urls and len(visited_urls) < max_pages:
             current_url = queued_urls.popleft()
             if current_url in visited_urls:
@@ -329,6 +432,7 @@ def audit_website(
                         "missing_title": True,
                         "missing_meta_description": True,
                         "missing_h1": True,
+                        "duplicate_title": False,
                     }
                 )
                 continue
@@ -355,6 +459,7 @@ def audit_website(
                     "missing_title": page_data["missing_title"],
                     "missing_meta_description": page_data["missing_meta_description"],
                     "missing_h1": page_data["missing_h1"],
+                    "duplicate_title": False,
                 }
             )
 
@@ -373,14 +478,15 @@ def audit_website(
                     discovered_urls.add(link)
                     queued_urls.append(link)
 
-    return pages_report, broken_links_report
+    annotate_duplicate_titles(pages_report)
+    return pages_report, broken_links_report, site_report
 
 
 def main() -> None:
     args = parse_args()
 
     try:
-        pages_report, broken_links_report = audit_website(
+        pages_report, broken_links_report, site_report = audit_website(
             args.start_url,
             args.max_pages,
             args.timeout,
@@ -388,6 +494,7 @@ def main() -> None:
         )
         write_pages_report(pages_report)
         write_broken_links_report(broken_links_report)
+        write_site_report(site_report)
     except ValueError as exc:
         print(f"[ERROR] {exc}")
         raise SystemExit(1) from exc
@@ -404,7 +511,8 @@ def main() -> None:
     )
     print(f"[DONE] Отчёт по страницам: {PAGES_REPORT_FILE}")
     print(f"[DONE] Отчёт по битым ссылкам: {BROKEN_LINKS_REPORT_FILE}")
-    print_summary(pages_report, broken_links_report)
+    print(f"[DONE] Отчёт по сайту: {SITE_REPORT_FILE}")
+    print_summary(pages_report, broken_links_report, site_report)
 
 
 if __name__ == "__main__":
