@@ -1,17 +1,22 @@
 import argparse
 import csv
 import time
-from collections import deque
+import warnings
+from collections import Counter, deque
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urldefrag, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.exceptions import InsecureRequestWarning
+from urllib3.util.retry import Retry
 
 
 REQUEST_TIMEOUT = 10
 PAGES_REPORT_FILE = "pages_report.csv"
 BROKEN_LINKS_REPORT_FILE = "broken_links_report.csv"
+REQUEST_FAILED_STATUS = "REQUEST_FAILED"
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,6 +29,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="Максимальное количество страниц для обхода (по умолчанию: 10)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=REQUEST_TIMEOUT,
+        help=f"Таймаут HTTP-запроса в секундах (по умолчанию: {REQUEST_TIMEOUT})",
+    )
+    parser.add_argument(
+        "--allow-insecure",
+        action="store_true",
+        help="Отключить SSL-проверку сертификата, если сайт отвечает с ошибками TLS.",
     )
     return parser.parse_args()
 
@@ -44,11 +60,38 @@ def is_internal_link(url: str, domain: str) -> bool:
     return parsed.hostname == domain
 
 
-def fetch_url(session: requests.Session, url: str) -> Tuple[Optional[requests.Response], Optional[str], int]:
+def create_session(allow_insecure: bool) -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Website Auditor/1.1"})
+
+    retry_strategy = Retry(
+        total=2,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.verify = not allow_insecure
+
+    if allow_insecure:
+        warnings.simplefilter("ignore", InsecureRequestWarning)
+
+    return session
+
+
+def send_request(
+    session: requests.Session,
+    method: str,
+    url: str,
+    timeout: int,
+) -> Tuple[Optional[requests.Response], Optional[str], int]:
     start = time.perf_counter()
 
     try:
-        response = session.get(url, timeout=REQUEST_TIMEOUT)
+        response = session.request(method=method, url=url, timeout=timeout, allow_redirects=True)
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         return response, None, elapsed_ms
     except requests.RequestException as exc:
@@ -56,12 +99,32 @@ def fetch_url(session: requests.Session, url: str) -> Tuple[Optional[requests.Re
         return None, str(exc), elapsed_ms
 
 
-def extract_title_and_links(html: str, base_url: str, domain: str) -> Tuple[str, Set[str]]:
+def extract_page_data(html: str, base_url: str, domain: str) -> Dict[str, object]:
     soup = BeautifulSoup(html, "html.parser")
+
     title_tag = soup.find("title")
     title = title_tag.get_text(strip=True) if title_tag else ""
 
+    meta_description_tag = soup.find(
+        "meta",
+        attrs={"name": lambda value: isinstance(value, str) and value.lower() == "description"},
+    )
+    meta_description = ""
+    if meta_description_tag:
+        meta_description = meta_description_tag.get("content", "").strip()
+
+    canonical_tag = soup.find(
+        "link",
+        rel=lambda value: isinstance(value, str) and "canonical" in value.lower(),
+    )
+    canonical_url = ""
+    if canonical_tag and canonical_tag.get("href"):
+        canonical_candidate = urljoin(base_url, canonical_tag["href"])
+        canonical_url = normalize_url(canonical_candidate) or canonical_candidate
+
+    h1_tags = soup.find_all("h1")
     internal_links: Set[str] = set()
+
     for anchor in soup.find_all("a", href=True):
         href = anchor["href"].strip()
         if not href or href.startswith(("mailto:", "tel:", "javascript:")):
@@ -72,18 +135,33 @@ def extract_title_and_links(html: str, base_url: str, domain: str) -> Tuple[str,
         if normalized_url and is_internal_link(normalized_url, domain):
             internal_links.add(normalized_url)
 
-    return title, internal_links
+    return {
+        "title": title,
+        "meta_description": meta_description,
+        "meta_description_length": len(meta_description),
+        "canonical_url": canonical_url,
+        "h1_count": len(h1_tags),
+        "internal_links": internal_links,
+        "missing_title": not bool(title),
+        "missing_meta_description": not bool(meta_description),
+        "missing_h1": len(h1_tags) == 0,
+    }
 
 
 def get_link_status(
     session: requests.Session,
     url: str,
+    timeout: int,
     status_cache: Dict[str, Tuple[Optional[int], bool]],
 ) -> Tuple[Optional[int], bool]:
     if url in status_cache:
         return status_cache[url]
 
-    response, error, _ = fetch_url(session, url)
+    response, error, _ = send_request(session, "HEAD", url, timeout)
+
+    if error or (response is not None and response.status_code in {403, 405}):
+        response, error, _ = send_request(session, "GET", url, timeout)
+
     if error:
         status_cache[url] = (None, True)
         return status_cache[url]
@@ -96,16 +174,38 @@ def write_pages_report(pages: List[Dict[str, object]]) -> None:
     with open(PAGES_REPORT_FILE, "w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
         writer.writerow(
-            ["url", "http_status", "response_time_ms", "title", "internal_links_count"]
+            [
+                "url",
+                "final_url",
+                "http_status",
+                "response_time_ms",
+                "redirect_count",
+                "title",
+                "meta_description_length",
+                "canonical_url",
+                "h1_count",
+                "internal_links_count",
+                "missing_title",
+                "missing_meta_description",
+                "missing_h1",
+            ]
         )
         for page in pages:
             writer.writerow(
                 [
                     page["url"],
+                    page["final_url"],
                     page["status"],
                     page["response_time_ms"],
+                    page["redirect_count"],
                     page["title"],
+                    page["meta_description_length"],
+                    page["canonical_url"],
+                    page["h1_count"],
                     page["internal_links_count"],
+                    page["missing_title"],
+                    page["missing_meta_description"],
+                    page["missing_h1"],
                 ]
             )
 
@@ -118,13 +218,62 @@ def write_broken_links_report(broken_links: List[Dict[str, object]]) -> None:
             writer.writerow([item["source_page"], item["broken_link"], item["status"]])
 
 
-def audit_website(start_url: str, max_pages: int) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+def append_failed_page(
+    pages_report: List[Dict[str, object]],
+    url: str,
+    status: object,
+    response_time_ms: int,
+) -> None:
+    pages_report.append(
+        {
+            "url": url,
+            "final_url": url,
+            "status": status,
+            "response_time_ms": response_time_ms,
+            "redirect_count": 0,
+            "title": "",
+            "meta_description_length": 0,
+            "canonical_url": "",
+            "h1_count": 0,
+            "internal_links_count": 0,
+            "missing_title": True,
+            "missing_meta_description": True,
+            "missing_h1": True,
+        }
+    )
+
+
+def print_summary(pages_report: List[Dict[str, object]], broken_links_report: List[Dict[str, object]]) -> None:
+    title_issues = sum(1 for page in pages_report if page["missing_title"])
+    meta_issues = sum(1 for page in pages_report if page["missing_meta_description"])
+    h1_issues = sum(1 for page in pages_report if page["missing_h1"])
+    redirects = sum(1 for page in pages_report if page["redirect_count"] > 0)
+    status_counter = Counter(str(item["status"]) for item in broken_links_report)
+
+    print(
+        f"[SUMMARY] Без title: {title_issues}, без meta description: {meta_issues}, "
+        f"без H1: {h1_issues}, страниц с редиректами: {redirects}"
+    )
+    if status_counter:
+        formatted = ", ".join(f"{status}: {count}" for status, count in sorted(status_counter.items()))
+        print(f"[SUMMARY] Битые ссылки по статусам: {formatted}")
+
+
+def audit_website(
+    start_url: str,
+    max_pages: int,
+    timeout: int,
+    allow_insecure: bool,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     normalized_start_url = normalize_url(start_url)
     if not normalized_start_url:
         raise ValueError("Стартовый URL должен быть абсолютным HTTP(S)-адресом.")
 
     if max_pages <= 0:
         raise ValueError("--max-pages должен быть положительным числом.")
+
+    if timeout <= 0:
+        raise ValueError("--timeout должен быть положительным числом.")
 
     domain = urlparse(normalized_start_url).hostname
     if not domain:
@@ -137,84 +286,86 @@ def audit_website(start_url: str, max_pages: int) -> Tuple[List[Dict[str, object
     discovered_urls: Set[str] = {normalized_start_url}
     status_cache: Dict[str, Tuple[Optional[int], bool]] = {}
 
-    with requests.Session() as session:
-        session.headers.update({"User-Agent": "Website Auditor/1.0"})
-
+    with create_session(allow_insecure) as session:
         while queued_urls and len(visited_urls) < max_pages:
             current_url = queued_urls.popleft()
             if current_url in visited_urls:
                 continue
 
             print(f"[INFO] Проверка страницы: {current_url}")
-            response, error, elapsed_ms = fetch_url(session, current_url)
+            response, error, elapsed_ms = send_request(session, "GET", current_url, timeout)
             visited_urls.add(current_url)
 
             if error:
                 print(f"[WARN] Ошибка запроса: {error}")
                 status_cache[current_url] = (None, True)
-                pages_report.append(
-                    {
-                        "url": current_url,
-                        "status": "REQUEST_FAILED",
-                        "response_time_ms": elapsed_ms,
-                        "title": "",
-                        "internal_links_count": 0,
-                    }
-                )
+                append_failed_page(pages_report, current_url, REQUEST_FAILED_STATUS, elapsed_ms)
                 continue
 
             status_cache[current_url] = (response.status_code, response.status_code >= 400)
 
             if response.status_code >= 400:
                 print(f"[WARN] Страница вернула HTTP {response.status_code}")
-                pages_report.append(
-                    {
-                        "url": current_url,
-                        "status": response.status_code,
-                        "response_time_ms": elapsed_ms,
-                        "title": "",
-                        "internal_links_count": 0,
-                    }
-                )
+                append_failed_page(pages_report, current_url, response.status_code, elapsed_ms)
                 continue
 
             content_type = response.headers.get("Content-Type", "")
+            final_url = normalize_url(response.url) or response.url
+            redirect_count = len(response.history)
             if "html" not in content_type.lower():
                 print("[INFO] Пропуск разбора: контент не является HTML")
                 pages_report.append(
                     {
                         "url": current_url,
+                        "final_url": final_url,
                         "status": response.status_code,
                         "response_time_ms": elapsed_ms,
+                        "redirect_count": redirect_count,
                         "title": "",
+                        "meta_description_length": 0,
+                        "canonical_url": "",
+                        "h1_count": 0,
                         "internal_links_count": 0,
+                        "missing_title": True,
+                        "missing_meta_description": True,
+                        "missing_h1": True,
                     }
                 )
                 continue
 
-            title, internal_links = extract_title_and_links(response.text, current_url, domain)
+            page_data = extract_page_data(response.text, final_url, domain)
+            internal_links = page_data["internal_links"]
             print(
-                f"[INFO] HTTP {response.status_code}, {elapsed_ms} мс, найдено внутренних ссылок: {len(internal_links)}"
+                f"[INFO] HTTP {response.status_code}, {elapsed_ms} мс, "
+                f"редиректов: {redirect_count}, внутренних ссылок: {len(internal_links)}"
             )
 
             pages_report.append(
                 {
                     "url": current_url,
+                    "final_url": final_url,
                     "status": response.status_code,
                     "response_time_ms": elapsed_ms,
-                    "title": title,
+                    "redirect_count": redirect_count,
+                    "title": page_data["title"],
+                    "meta_description_length": page_data["meta_description_length"],
+                    "canonical_url": page_data["canonical_url"],
+                    "h1_count": page_data["h1_count"],
                     "internal_links_count": len(internal_links),
+                    "missing_title": page_data["missing_title"],
+                    "missing_meta_description": page_data["missing_meta_description"],
+                    "missing_h1": page_data["missing_h1"],
                 }
             )
 
             for link in sorted(internal_links):
-                status_code, is_broken = get_link_status(session, link, status_cache)
+                status_code, is_broken = get_link_status(session, link, timeout, status_cache)
                 if is_broken:
                     broken_links_report.append(
                         {
                             "source_page": current_url,
                             "broken_link": link,
-                            "status": status_code if status_code is not None else "REQUEST_FAILED",
+                            "status": status_code if status_code is not None else REQUEST_FAILED_STATUS,
                         }
                     )
 
@@ -229,7 +380,12 @@ def main() -> None:
     args = parse_args()
 
     try:
-        pages_report, broken_links_report = audit_website(args.start_url, args.max_pages)
+        pages_report, broken_links_report = audit_website(
+            args.start_url,
+            args.max_pages,
+            args.timeout,
+            args.allow_insecure,
+        )
         write_pages_report(pages_report)
         write_broken_links_report(broken_links_report)
     except ValueError as exc:
@@ -248,6 +404,7 @@ def main() -> None:
     )
     print(f"[DONE] Отчёт по страницам: {PAGES_REPORT_FILE}")
     print(f"[DONE] Отчёт по битым ссылкам: {BROKEN_LINKS_REPORT_FILE}")
+    print_summary(pages_report, broken_links_report)
 
 
 if __name__ == "__main__":
